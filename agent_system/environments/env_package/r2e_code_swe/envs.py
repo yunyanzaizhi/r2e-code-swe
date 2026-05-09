@@ -425,7 +425,7 @@ class R2ECodeSWEEnv(gym.Env):
             message = (
                 "Repeated failed tool call blocked. Do not repeat the same failed action. "
                 "If grep failed, include both a pattern and an actual path from the workspace preview, "
-                "for example: grep -RIn -- 'term' . | head -50. "
+                "for example: { grep -RIn -- 'term' . | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }. "
                 "If a path was not found, run pwd && find . -maxdepth 3 -type f | head -80 from /testbed. "
                 "If a file view was clipped, use str_replace_editor view with a narrow view_range before editing."
             )

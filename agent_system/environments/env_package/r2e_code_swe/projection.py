@@ -329,8 +329,16 @@ def _normalize_view_range(value: Any) -> Tuple[List[int] | None, str | None]:
     return None, text or None
 
 
+def _safe_grep_head_command(pattern_q: str, path: str = ".", max_lines: int = 50) -> str:
+    path_q = shlex.quote(path)
+    return (
+        f"{{ grep -RIn -- {pattern_q} {path_q} | head -{max_lines}; "
+        'status=${PIPESTATUS[0]}; test "$status" -eq 0 -o "$status" -eq 141; }'
+    )
+
+
 def _grep_search_action(search_term: str, path: str) -> Dict[str, Any]:
-    cmd = f"grep -RIn -- {_single_quote(search_term)} {shlex.quote(path)} | head -50"
+    cmd = _safe_grep_head_command(_single_quote(search_term), path)
     return {"tool_name": "bash", "parameters": {"cmd": cmd}}
 
 
@@ -354,7 +362,7 @@ def _repair_cd_file_path(cmd: str) -> str:
 
 def _repair_grep_without_path(cmd: str) -> str:
     def replace(match: re.Match) -> str:
-        return f"{match.group('prefix')}grep -RIn -- {match.group('pattern')} . | head -50 "
+        return f"{match.group('prefix')}{_safe_grep_head_command(match.group('pattern'))} "
 
     return _GREP_WITHOUT_PATH_RE.sub(replace, cmd).strip()
 

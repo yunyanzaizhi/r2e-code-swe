@@ -146,10 +146,19 @@ def _shell_single_quote(text: str) -> str:
     return "'" + str(text).replace("'", "'\"'\"'") + "'"
 
 
+def _safe_grep_head_command(pattern: str, path: str = ".", max_lines: int = 50) -> str:
+    pattern_q = _shell_single_quote(pattern)
+    path_q = shlex.quote(path)
+    return (
+        f"{{ grep -RIn -- {pattern_q} {path_q} | head -{max_lines}; "
+        'status=${PIPESTATUS[0]}; test "$status" -eq 0 -o "$status" -eq 141; }'
+    )
+
+
 def _issue_grep_example(task: Optional[R2ECodeSWETask]) -> str:
     terms = issue_search_terms(task)
     keyword = terms[0] if terms else "issue keyword"
-    return f"grep -RIn -- {_shell_single_quote(keyword)} . | head -50"
+    return _safe_grep_head_command(keyword)
 
 
 def _as_string_list(value: Any) -> List[str]:

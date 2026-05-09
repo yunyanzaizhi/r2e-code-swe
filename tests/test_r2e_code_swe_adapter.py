@@ -240,7 +240,7 @@ def test_issue_grep_example_uses_first_source_symbol_not_quoted_text():
 
     prompt = build_initial_prompt(task, current_observation="Workspace ready.")
 
-    assert "<parameter=cmd>grep -RIn -- 'DiscreteVariable' . | head -50</parameter>" in prompt
+    assert "<parameter=cmd>{ grep -RIn -- 'DiscreteVariable' . | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }</parameter>" in prompt
     assert "grep -RIn -- 'user visible failure'" not in prompt
 
 
@@ -266,7 +266,7 @@ def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():
     assert "Your response must be exactly one XML tool call and nothing else." in prompt
     assert "<function=bash>" in prompt
     assert "<parameter=cmd>pwd && find . -maxdepth 4 -type f | head -160</parameter>" in prompt
-    assert "<parameter=cmd>grep -RIn -- 'IncompatibleContext' . | head -50</parameter>" in prompt
+    assert "<parameter=cmd>{ grep -RIn -- 'IncompatibleContext' . | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }</parameter>" in prompt
     assert "<function=str_replace_editor>" in prompt
     assert "<parameter=command>view</parameter>" in prompt
     assert "<parameter=path>/testbed</parameter>" in prompt
@@ -324,7 +324,7 @@ def test_step_prompt_uses_current_issue_search_terms_for_allowed_grep():
     )
 
     assert issue_search_terms(task)[0] == "TypeError"
-    assert "<parameter=cmd>grep -RIn -- 'TypeError' . | head -50</parameter>" in prompt
+    assert "<parameter=cmd>{ grep -RIn -- 'TypeError' . | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }</parameter>" in prompt
     assert "grep -RIn -- 'TransferEncodingError'" not in prompt
     assert "/testbed/aiohttp/http_parser.py" not in prompt
 
@@ -668,7 +668,7 @@ def test_parse_r2e_action_repairs_common_bash_search_mistakes():
     assert bad_search.action == {
         "tool_name": "bash",
         "parameters": {
-            "cmd": 'cd /testbed/aiohttp && grep -RIn -- "TransferEncodingError" . | head -50 && find . -maxdepth 2 -type f | head -100'
+            "cmd": 'cd /testbed/aiohttp && { grep -RIn -- "TransferEncodingError" . | head -50; status=${PIPESTATUS[0]}; test "$status" -eq 0 -o "$status" -eq 141; } && find . -maxdepth 2 -type f | head -100'
         },
     }
 
@@ -712,7 +712,7 @@ def test_parse_r2e_action_normalizes_editor_paths_and_search_ranges():
     assert symbolic_view_range.is_valid
     assert symbolic_view_range.action == {
         "tool_name": "bash",
-        "parameters": {"cmd": "grep -RIn -- 'DiscreteVariable' /testbed/Orange/data.py | head -50"},
+        "parameters": {"cmd": "{ grep -RIn -- 'DiscreteVariable' /testbed/Orange/data.py | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }"},
     }
 
     command_view_range = parse_r2e_action(
@@ -891,7 +891,7 @@ def test_parse_r2e_action_accepts_xml_parameter_schema_variants():
     assert parameters_container.is_valid
     assert parameters_container.action == {
         "tool_name": "bash",
-        "parameters": {"cmd": "grep -RIn -- 'DiscreteVariable' /testbed/Orange/data.py | head -50"},
+        "parameters": {"cmd": "{ grep -RIn -- 'DiscreteVariable' /testbed/Orange/data.py | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }"},
     }
 
     comma_kv_body = parse_r2e_action(
@@ -1075,6 +1075,39 @@ def test_r2e_runtime_separates_protocol_validity_from_bash_execution_failure():
     assert result.info["fail_reason"] == "command_failed"
 
 
+def test_r2e_runtime_normalizes_grep_head_sigpipe_with_output():
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1))
+    runtime.env = SimpleNamespace(
+        runtime=SimpleNamespace(run=lambda *args, **kwargs: ("/testbed/a.py:1:ContextHandler\n", "141"))
+    )
+
+    result = runtime.run_bash("grep -RIn -- 'ContextHandler' . | head -50")
+
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is True
+    assert result.info["fail_reason"] is None
+    assert result.info["tool_execution_fail_reason"] is None
+    assert result.info["exit_code"] == "0"
+    assert result.info["original_exit_code"] == "141"
+    assert result.info["normalized_exit_code"] == "0"
+    assert result.info["adapter_recovery"] == "grep_head_sigpipe"
+    assert "Normalized grep|head SIGPIPE exit 141 to success" in result.observation
+
+
+def test_r2e_runtime_does_not_normalize_empty_grep_head_sigpipe():
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1))
+    runtime.env = SimpleNamespace(
+        runtime=SimpleNamespace(run=lambda *args, **kwargs: ("", "141"))
+    )
+
+    result = runtime.run_bash("grep -RIn -- 'ContextHandler' . | head -50")
+
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is False
+    assert result.info["fail_reason"] == "command_failed"
+    assert "original_exit_code" not in result.info
+
+
 
 
 def test_prompt_includes_r2e_str_replace_uniqueness_guidance():
@@ -1243,6 +1276,71 @@ def test_r2e_runtime_separates_protocol_validity_from_editor_execution_failure()
     unsafe_path = runtime.run_editor({"command": "view", "path": "/tmp/missing.py"})
     assert unsafe_path.is_action_valid is False
     assert unsafe_path.info["tool_execution_fail_reason"] == "invalid_path"
+
+
+def test_r2e_runtime_editor_path_error_adds_candidate_recovery_hint():
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            return ("ERROR: The path '/testbed/Orange/data.py' does not exist.\n", "0")
+        return (
+            json.dumps(
+                {
+                    "candidates": [
+                        "/testbed/Orange/data/__init__.py",
+                        "/testbed/Orange/data/variable.py",
+                    ],
+                    "terms": ["data.py", "data", "Orange"],
+                    "scanned": 200,
+                }
+            ),
+            "0",
+        )
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=4000))
+    runtime.env = SimpleNamespace(runtime=SimpleNamespace(run=fake_run))
+
+    result = runtime.run_editor({"command": "view", "path": "/testbed/Orange/data.py"})
+
+    assert len(calls) == 2
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is False
+    assert result.info["tool_execution_fail_reason"] == "editor_error"
+    assert result.info["fail_reason"] == "editor_error"
+    assert result.info["editor_recovery_hint"] == "path_not_found"
+    assert result.info["path_recovery_requested_path"] == "/testbed/Orange/data.py"
+    assert result.info["path_recovery_candidates"] == [
+        "/testbed/Orange/data/__init__.py",
+        "/testbed/Orange/data/variable.py",
+    ]
+    assert "[path recovery] The requested path does not exist. Do not repeat this path." in result.observation
+    assert "Candidate files:" in result.observation
+    assert "/testbed/Orange/data/__init__.py" in result.observation
+    assert "Use one of the exact paths above" in result.observation
+
+
+def test_r2e_runtime_editor_path_error_falls_back_to_find_when_no_candidates():
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            return ("ERROR: cannot open '/testbed/aiohttp/base_connector.py'\n", "0")
+        return (json.dumps({"candidates": [], "terms": ["base_connector.py", "base_connector", "connector"]}), "0")
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=4000))
+    runtime.env = SimpleNamespace(runtime=SimpleNamespace(run=fake_run))
+
+    result = runtime.run_editor({"command": "view", "path": "/testbed/aiohttp/base_connector.py"})
+
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is False
+    assert result.info["editor_recovery_hint"] == "path_not_found"
+    assert result.info["path_recovery_candidates"] == []
+    assert "Candidate files: none found." in result.observation
+    assert "Run pwd && find . -maxdepth 4 -type f | head -160" in result.observation
 
 def _r2e_task_for_env_policy_tests():
     return normalize_r2e_task_record(

@@ -50,6 +50,35 @@ class R2EToolResult:
     info: Dict[str, Any] = field(default_factory=dict)
 
 
+def _is_recoverable_grep_head_sigpipe(command: str, exit_code: str, output: Any) -> bool:
+    """grep | head can exit 141 when head closes after producing useful output."""
+    if str(exit_code) != "141" or not str(output or "").strip():
+        return False
+    command_text = str(command or "")
+    return bool(
+        re.search(r"\bgrep\b", command_text, flags=re.DOTALL)
+        and re.search(r"\|\s*head\b", command_text, flags=re.DOTALL)
+    )
+
+
+_EDITOR_PATH_ERROR_RE = re.compile(
+    r"(?:"
+    r"path\b.*\bdoes not exist|"
+    r"does not exist|"
+    r"no such file|"
+    r"not found|"
+    r"cannot open|"
+    r"can't open|"
+    r"not a directory"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_editor_path_error(output: str) -> bool:
+    return bool(_EDITOR_PATH_ERROR_RE.search(str(output or "")))
+
+
 def _safe_name(text: str, max_len: int = 120) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text))[:max_len] or "unknown"
 
@@ -223,22 +252,40 @@ class R2ERepoRuntime:
         user_command = str(command or "")
         shell_command = "bash -lc " + shlex.quote("set -o pipefail\n" + user_command)
         output, code = self.env.runtime.run(shell_command, timeout=self.config.command_timeout, workdir=workdir)
-        code_s = str(code)
-        observation = f"Exit code: {code_s}\n[output]\n{clip_text(output, self.config.max_output_chars, 'command output')}"
+        original_code_s = str(code)
+        code_s = original_code_s
+        output_text = str(output or "")
+        recovery_message = ""
+        recovered_grep_sigpipe = _is_recoverable_grep_head_sigpipe(user_command, original_code_s, output_text)
+        if recovered_grep_sigpipe:
+            code_s = "0"
+            recovery_message = (
+                "\n[adapter recovery] Normalized grep|head SIGPIPE exit 141 to success "
+                "because search output was produced."
+            )
+        observation = (
+            f"Exit code: {code_s}\n[output]\n"
+            f"{clip_text(output_text, self.config.max_output_chars, 'command output')}{recovery_message}"
+        )
         execution_success = code_s == "0"
         fail_reason = None if execution_success else ("timeout" if code_s == "-1" and "too long" in str(output).lower() else "command_failed")
-        return R2EToolResult(
-            observation=observation,
-            is_action_valid=True,
-            info={
-                "exit_code": code_s,
-                "stdout": clip_text(output, self.config.max_output_chars, "stdout"),
-                "stderr": "",
-                "fail_reason": fail_reason,
-                "tool_execution_success": execution_success,
-                "tool_execution_fail_reason": fail_reason,
-            },
-        )
+        info = {
+            "exit_code": code_s,
+            "stdout": clip_text(output_text, self.config.max_output_chars, "stdout"),
+            "stderr": "",
+            "fail_reason": fail_reason,
+            "tool_execution_success": execution_success,
+            "tool_execution_fail_reason": fail_reason,
+        }
+        if recovered_grep_sigpipe:
+            info.update(
+                {
+                    "original_exit_code": original_code_s,
+                    "normalized_exit_code": code_s,
+                    "adapter_recovery": "grep_head_sigpipe",
+                }
+            )
+        return R2EToolResult(observation=observation, is_action_valid=True, info=info)
 
     def workspace_overview(self) -> str:
         """Return a short R2E-native view of the repository root for the initial observation."""
@@ -278,6 +325,136 @@ class R2ERepoRuntime:
                 value = json.dumps(list(value))
             parts.extend([f"--{key}", shlex.quote(str(value))])
         return " ".join(parts)
+
+    def _path_recovery_command(self, path: str) -> str:
+        payload = {"path": str(path or "")}
+        encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+        script = f"""import base64, json, os, re
+from pathlib import Path
+
+payload = json.loads(base64.b64decode({json.dumps(encoded)}).decode("utf-8"))
+requested = Path(payload.get("path") or "/testbed")
+root = Path("/testbed")
+name = requested.name
+stem = requested.stem
+suffix = requested.suffix
+
+terms = []
+def add(term):
+    term = str(term or "").strip()
+    if term and term not in terms:
+        terms.append(term)
+
+add(name)
+add(stem)
+for part in re.split(r"[_\\-.]+", stem):
+    if len(part) >= 4:
+        add(part)
+
+try:
+    relative_parts = requested.relative_to(root).parts
+except ValueError:
+    relative_parts = requested.parts
+for part in relative_parts[:-1]:
+    if part and part not in {{"", os.sep}}:
+        add(part)
+
+parent = requested.parent
+try:
+    parent_exists = parent.exists() and parent.is_dir() and root in [parent, *parent.parents]
+except Exception:
+    parent_exists = False
+
+skip_dirs = {{".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".tox", ".venv", "venv"}}
+candidates = []
+scanned = 0
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    dir_path = Path(dirpath)
+    for filename in filenames:
+        scanned += 1
+        if scanned > 50000:
+            break
+        file_path = dir_path / filename
+        file_text = str(file_path)
+        file_lower = file_text.lower()
+        parts_lower = [part.lower() for part in file_path.parts]
+        rank = 100
+        if parent_exists:
+            try:
+                file_path.relative_to(parent)
+                rank -= 20
+            except ValueError:
+                pass
+        if name and filename == name:
+            rank = min(rank, 0)
+        if stem and file_path.stem == stem:
+            rank = min(rank, 2)
+        if stem and stem.lower() in parts_lower:
+            rank = min(rank, 4)
+        if stem and stem.lower() in filename.lower():
+            rank = min(rank, 6)
+        for index, term in enumerate(terms):
+            term_lower = term.lower()
+            if term_lower and term_lower in file_lower:
+                rank = min(rank, 10 + index)
+        if suffix and file_path.suffix == suffix:
+            rank -= 1
+        if rank < 100:
+            candidates.append((rank, len(file_text), file_text))
+    if scanned > 50000:
+        break
+
+candidates.sort()
+paths = []
+seen = set()
+for _, _, file_text in candidates:
+    if file_text in seen:
+        continue
+    seen.add(file_text)
+    paths.append(file_text)
+    if len(paths) >= 20:
+        break
+
+print(json.dumps({{"candidates": paths, "terms": terms[:8], "scanned": scanned}}))
+"""
+        return "bash -lc " + shlex.quote("python3 - <<'PY'\n" + script + "\nPY")
+
+    def _path_recovery_hint(self, path: str) -> Tuple[str, List[str]]:
+        candidates: List[str] = []
+        if not path:
+            return (
+                "[path recovery] The requested path does not exist. Do not repeat this path.\n"
+                "Candidate files: none found.\n"
+                "Run pwd && find . -maxdepth 4 -type f | head -160, then use exact paths from output.",
+                candidates,
+            )
+
+        probe_output, probe_code = self.env.runtime.run(
+            self._path_recovery_command(path),
+            timeout=self.config.command_timeout,
+            workdir="/testbed",
+        )
+        if str(probe_code) == "0":
+            try:
+                data = json.loads(str(probe_output or "{}"))
+                raw_candidates = data.get("candidates") if isinstance(data, dict) else []
+                if isinstance(raw_candidates, list):
+                    candidates = [str(item) for item in raw_candidates if str(item).startswith("/testbed/")]
+            except json.JSONDecodeError:
+                candidates = []
+
+        lines = [
+            "[path recovery] The requested path does not exist. Do not repeat this path.",
+        ]
+        if candidates:
+            lines.append("Candidate files:")
+            lines.extend(f"- {candidate}" for candidate in candidates[:20])
+            lines.append("Use one of the exact paths above, or run find/grep again.")
+        else:
+            lines.append("Candidate files: none found.")
+            lines.append("Run pwd && find . -maxdepth 4 -type f | head -160, then use exact paths from output.")
+        return "\n".join(lines), candidates
 
     def _missing_indent_repair_command(self, params: Dict[str, Any]) -> str:
         payload = {
@@ -590,6 +767,13 @@ print(json.dumps({{
                 "\n[editor recovery] str_replace old_str did not match the file. "
                 "R2E requires exact text including leading whitespace; view a narrow range and copy the original lines exactly."
             )
+        path_recovery_candidates: List[str] = []
+        path_recovery_applied = False
+        if not execution_success and _is_editor_path_error(output_text):
+            path_recovery_applied = True
+            editor_recovery_hint = "path_not_found"
+            path_hint, path_recovery_candidates = self._path_recovery_hint(path)
+            output_text += "\n" + path_hint
         observation = f"Exit code: {code_s}\n[output]\n{clip_text(output_text, self.config.max_output_chars, 'editor output')}"
         info = {
             "exit_code": code_s,
@@ -601,6 +785,9 @@ print(json.dumps({{
         }
         if editor_recovery_hint:
             info["editor_recovery_hint"] = editor_recovery_hint
+        if path_recovery_applied:
+            info["path_recovery_requested_path"] = path
+            info["path_recovery_candidates"] = path_recovery_candidates
         return R2EToolResult(
             observation=observation,
             is_action_valid=True,
