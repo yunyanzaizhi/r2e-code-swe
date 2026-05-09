@@ -11,6 +11,7 @@ from agent_system.environments.env_package.r2e_code_swe.projection import parse_
 from agent_system.environments.env_package.r2e_code_swe.prompts import (
     build_initial_prompt,
     build_step_prompt,
+    focused_validation_cmd,
     format_r2e_action_for_history,
     format_r2e_history_turn,
     issue_search_terms,
@@ -75,6 +76,96 @@ def test_prompt_never_leaks_expected_output_or_gold_patch():
     assert "namanjain12/aiohttp_final:abc123" in prompt
     assert "SECRET_TEST" not in prompt
     assert "SECRET_GOLD_PATCH" not in prompt
+
+
+def test_focused_validation_cmd_prefers_dataset_run_tests():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+            "run_tests": "python -m pytest -q tests/test_http_parser.py::test_chunk_split",
+            "FAIL_TO_PASS": ["tests/test_http_parser.py::test_should_not_be_used"],
+        },
+        "R2E-Gym/SWE-Bench-Lite",
+        "test",
+    )
+
+    assert focused_validation_cmd(task) == "python -m pytest -q tests/test_http_parser.py::test_chunk_split"
+
+
+def test_focused_validation_cmd_uses_fail_to_pass_and_small_pass_to_pass():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix connector limits.",
+            "FAIL_TO_PASS": ["tests/test_connector.py::test_limit", "tests/test_client.py::test_close"],
+            "PASS_TO_PASS": [
+                "tests/test_connector.py::test_regression_a",
+                "tests/test_connector.py::test_regression_b",
+                "tests/test_connector.py::test_regression_c",
+            ],
+        },
+        "R2E-Gym/SWE-Bench-Lite",
+        "test",
+    )
+
+    assert focused_validation_cmd(task) == (
+        "python -m pytest -q "
+        "tests/test_connector.py::test_limit "
+        "tests/test_client.py::test_close "
+        "tests/test_connector.py::test_regression_a "
+        "tests/test_connector.py::test_regression_b"
+    )
+
+
+def test_focused_validation_cmd_falls_back_without_test_spec():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+        },
+        "R2E-Gym/R2E-Gym-Lite",
+        "dev_10pr_v1",
+    )
+
+    assert focused_validation_cmd(task) == "python -m pytest -q"
+
+
+def test_prompts_show_focused_validate_command_from_fail_to_pass():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+            "FAIL_TO_PASS": ["tests/test_http_parser.py::test_chunk_split"],
+        },
+        "R2E-Gym/SWE-Bench-Lite",
+        "test",
+    )
+
+    initial_prompt = build_initial_prompt(task, current_observation="Workspace ready.")
+    assert "Recommended focused validate command: python -m pytest -q tests/test_http_parser.py::test_chunk_split" in initial_prompt
+    assert "<function=validate>" not in initial_prompt
+
+    step_prompt = build_step_prompt(
+        task,
+        current_observation="The file has been edited.",
+        history_context="Previous step 1",
+        history_length=1,
+        current_step=2,
+        max_steps=5,
+        tool_mask={"allow_validate": True, "allow_submit": False},
+    )
+    assert "Recommended focused validate command: python -m pytest -q tests/test_http_parser.py::test_chunk_split" in step_prompt
+    assert "<parameter=cmd>python -m pytest -q tests/test_http_parser.py::test_chunk_split</parameter>" in step_prompt
+    assert "<parameter=cmd>python -m pytest -q</parameter>" not in step_prompt
 
 
 def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():

@@ -1,4 +1,5 @@
 import re
+import shlex
 from typing import Any, Dict, List, Optional
 
 from .tasks import R2ECodeSWETask
@@ -19,6 +20,84 @@ Invalid:
 - path with line suffix such as /testbed/foo.py:123
 """
 
+
+
+FOCUSED_VALIDATION_MAX_PASS_TO_PASS = 2
+
+
+def _as_string_list(value: Any) -> List[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _unique_strings(values: Iterable[str]) -> List[str]:
+    seen = set()
+    unique: List[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
+
+
+def focused_validation_cmd(task: Optional[R2ECodeSWETask]) -> str:
+    """Return the best focused validation command that can be safely shown to the model."""
+    spec = dict(getattr(task, "test_spec", None) or {})
+    run_tests = spec.get("run_tests")
+    run_test_cmds = _as_string_list(run_tests)
+    if run_test_cmds:
+        return " && ".join(run_test_cmds)
+
+    fail_to_pass = _as_string_list(spec.get("FAIL_TO_PASS"))
+    pass_to_pass = _as_string_list(spec.get("PASS_TO_PASS"))[:FOCUSED_VALIDATION_MAX_PASS_TO_PASS]
+    targets = _unique_strings([*fail_to_pass, *pass_to_pass])
+    if targets:
+        return "python -m pytest -q " + " ".join(shlex.quote(target) for target in targets)
+    return "python -m pytest -q"
+
+
+_ISSUE_TERM_PATTERNS = (
+    re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Warning)\b"),
+    re.compile(r"\b[A-Z][A-Za-z0-9_]{2,}\b"),
+)
+_COMMON_ISSUE_TERMS = {
+    "The", "This", "When", "After", "Before", "Saving", "Fix", "Bug", "Issue", "Repository",
+    "Docker", "Workspace", "FAIL", "PASS", "HTTP", "JSON", "XML",
+}
+
+
+def issue_search_terms(task: Optional[R2ECodeSWETask], max_terms: int = 3) -> List[str]:
+    text = str(getattr(task, "problem_statement", "") or "")
+    candidates: List[str] = []
+    for pattern in _ISSUE_TERM_PATTERNS:
+        for match in pattern.findall(text):
+            if match in _COMMON_ISSUE_TERMS:
+                continue
+            if match not in candidates:
+                candidates.append(match)
+            if len(candidates) >= max_terms:
+                return candidates
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", text)
+    for word in words:
+        if word in _COMMON_ISSUE_TERMS:
+            continue
+        if word not in candidates:
+            candidates.append(word)
+        if len(candidates) >= max_terms:
+            return candidates
+    return candidates or ["bug"]
+
+
+def _issue_grep_command(task: Optional[R2ECodeSWETask]) -> str:
+    term = issue_search_terms(task)[0]
+    return f"grep -RIn -- {shlex.quote(term)} . | head -50"
 
 def _normalize_tool_mask(tool_mask: Optional[Dict[str, Any]], *, initial: bool = False) -> Dict[str, Any]:
     mask = dict(tool_mask or {})
@@ -145,6 +224,25 @@ def _issue_grep_example(task: Optional[R2ECodeSWETask]) -> str:
     return f"grep -RIn -- {_shell_single_quote(keyword)} . | head -50"
 
 
+def _as_string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def focused_validation_cmd(task: Optional[R2ECodeSWETask], max_pass_to_pass: int = 2) -> str:
+    test_spec = getattr(task, "test_spec", None) or {}
+    run_tests = str(test_spec.get("run_tests") or "").strip()
+    if run_tests:
+        return run_tests
+
+    selected_tests = _as_string_list(test_spec.get("FAIL_TO_PASS"))
+    selected_tests.extend(_as_string_list(test_spec.get("PASS_TO_PASS"))[:max_pass_to_pass])
+    if selected_tests:
+        return "python -m pytest -q " + " ".join(shlex.quote(test) for test in selected_tests)
+    return "python -m pytest -q"
+
+
 def format_r2e_tool_mask(
     tool_mask: Optional[Dict[str, Any]],
     *,
@@ -192,7 +290,7 @@ def format_r2e_tool_mask(
     if mask["allow_validate"]:
         allowed.append(
             "<function=validate>\n"
-            "<parameter=cmd>python -m pytest -q</parameter>\n"
+            f"<parameter=cmd>{focused_validation_cmd(task)}</parameter>\n"
             "</function>"
         )
     else:
@@ -240,7 +338,7 @@ For insert include named parameter=insert_line and named parameter=new_str.
 
 3. validate
 Run a focused validation command inside the R2E Docker workspace after a successful source edit.
-Required parameter: cmd. The command must be test-like, for example python -m pytest -q, pytest -q, tox, unittest, r2e_tests, or run_tests.
+Required parameter: cmd. Prefer the Recommended focused validate command shown in this prompt. The command must be test-like, for example python -m pytest -q tests/test_file.py::test_name, pytest -q, tox, unittest, r2e_tests, or run_tests.
 A failing validation command still counts as useful feedback. Inspect the output and revise before submitting.
 
 4. submit
@@ -255,7 +353,7 @@ R2E_WORKFLOW_HINTS = """Search and edit strategy:
 - If an observation says a command was blocked as repeated or output was clipped, change strategy immediately: narrow the path/range, search a different symbol, or inspect a different file.
 - If str_replace says old_str is not unique, do not retry the same one-line replacement. View the target range and copy a larger consecutive block into old_str.
 - Do not edit setup, install, dependency, or generated helper files unless the issue explicitly asks; fixes should usually touch source files related to the behavior described by the issue.
-- After a source edit, use the validate tool before submit, usually with python -m pytest -q or a focused pytest command. A failing validation is useful feedback; inspect it and revise.
+- After a source edit, use the validate tool before submit, usually with the recommended focused validate command shown below. A failing validation is useful feedback; inspect it and revise.
 - Do not submit until at least one successful source edit and one post-edit validation command have happened, unless this is the final forced submission step.
 """
 
@@ -373,6 +471,8 @@ Hard constraints:
 
 {R2E_WORKFLOW_HINTS}
 
+Recommended focused validate command: {focused_validation_cmd(task)}
+
 {format_r2e_tool_mask(tool_mask, task=task, initial=True)}
 
 {R2E_TOOL_SPEC}
@@ -427,6 +527,8 @@ Hard constraints:
 - Before submit, run a focused validation command after the source edit so you can inspect failures and revise.
 
 {R2E_WORKFLOW_HINTS}
+
+Recommended focused validate command: {focused_validation_cmd(task)}
 
 {format_r2e_tool_mask(tool_mask, task=task, final_step=(max_steps is not None and current_step >= max_steps))}
 
