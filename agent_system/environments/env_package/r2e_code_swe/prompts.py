@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .tasks import R2ECodeSWETask
 
@@ -36,7 +36,122 @@ def _normalize_tool_mask(tool_mask: Optional[Dict[str, Any]], *, initial: bool =
     }
 
 
-def format_r2e_tool_mask(tool_mask: Optional[Dict[str, Any]], *, initial: bool = False, final_step: bool = False) -> str:
+_ISSUE_QUOTED_RE = re.compile(r"`([^`\n]{3,120})`|'([^'\n]{3,120})'|\"([^\"\n]{3,120})\"")
+_ISSUE_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
+_ISSUE_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b")
+_ISSUE_STOPWORDS = {
+    "about",
+    "after",
+    "against",
+    "also",
+    "because",
+    "before",
+    "between",
+    "broken",
+    "cannot",
+    "causes",
+    "change",
+    "correct",
+    "crash",
+    "does",
+    "during",
+    "error",
+    "expected",
+    "fails",
+    "failure",
+    "from",
+    "handle",
+    "handles",
+    "instead",
+    "issue",
+    "only",
+    "problem",
+    "raise",
+    "raises",
+    "return",
+    "should",
+    "using",
+    "when",
+    "where",
+    "with",
+    "without",
+    "wrong",
+}
+
+
+def _clean_issue_term(term: str) -> str:
+    term = sanitize_prompt_text(term)
+    term = re.sub(r"[<>&\x00-\x1f]+", " ", term)
+    term = re.sub(r"\s+", " ", term).strip(" ,.;:()[]{}")
+    return term[:120]
+
+
+def _add_issue_term(terms: List[str], seen: set, term: str) -> None:
+    term = _clean_issue_term(term)
+    if len(term) < 3:
+        return
+    key = term.lower()
+    if key in seen or key in _ISSUE_STOPWORDS:
+        return
+    seen.add(key)
+    terms.append(term)
+
+
+def _looks_issue_specific_identifier(token: str) -> bool:
+    if "." in token or "_" in token:
+        return True
+    if token.endswith(("Error", "Exception", "Warning")):
+        return True
+    return token[:1].isupper() and any(char.isupper() for char in token[1:])
+
+
+def issue_search_terms(task: Optional[R2ECodeSWETask], max_terms: int = 4) -> List[str]:
+    """Extract issue-specific terms that make useful first-pass grep queries."""
+    statement = getattr(task, "problem_statement", "") if task is not None else ""
+    statement = sanitize_prompt_text(statement)
+    terms: List[str] = []
+    seen = set()
+
+    for match in _ISSUE_QUOTED_RE.finditer(statement):
+        quoted = next(group for group in match.groups() if group)
+        _add_issue_term(terms, seen, quoted)
+        if len(terms) >= max_terms:
+            return terms
+
+    for match in _ISSUE_IDENTIFIER_RE.finditer(statement):
+        token = match.group(0)
+        if _looks_issue_specific_identifier(token):
+            _add_issue_term(terms, seen, token)
+            if len(terms) >= max_terms:
+                return terms
+
+    for match in _ISSUE_WORD_RE.finditer(statement):
+        token = match.group(0)
+        if token.lower() not in _ISSUE_STOPWORDS:
+            _add_issue_term(terms, seen, token)
+            if len(terms) >= max_terms:
+                return terms
+
+    return terms
+
+
+def _shell_single_quote(text: str) -> str:
+    return "'" + str(text).replace("'", "'\"'\"'") + "'"
+
+
+def _issue_grep_example(task: Optional[R2ECodeSWETask]) -> str:
+    terms = issue_search_terms(task)
+    keyword = terms[0] if terms else "issue keyword"
+    return f"grep -RIn -- {_shell_single_quote(keyword)} . | head -50"
+
+
+def format_r2e_tool_mask(
+    tool_mask: Optional[Dict[str, Any]],
+    *,
+    task: Optional[R2ECodeSWETask] = None,
+    initial: bool = False,
+    final_step: bool = False,
+) -> str:
     mask = _normalize_tool_mask(tool_mask, initial=initial)
     if final_step:
         mask.update({
@@ -57,21 +172,21 @@ def format_r2e_tool_mask(tool_mask: Optional[Dict[str, Any]], *, initial: bool =
         )
         allowed.append(
             "<function=bash>\n"
-            "<parameter=cmd>grep -RIn -- 'TransferEncodingError' /testbed/aiohttp | head -50</parameter>\n"
+            f"<parameter=cmd>{_issue_grep_example(task)}</parameter>\n"
             "</function>"
         )
     if mask["allow_str_replace_editor"]:
         allowed.append(
             "<function=str_replace_editor>\n"
             "<parameter=command>view</parameter>\n"
-            "<parameter=path>/testbed/aiohttp/http_parser.py</parameter>\n"
+            "<parameter=path>/testbed/path/to/relevant_file.py</parameter>\n"
             "</function>"
         )
         allowed.append(
             "<function=str_replace_editor>\n"
             "<parameter=command>view</parameter>\n"
-            "<parameter=path>/testbed/aiohttp/http_parser.py</parameter>\n"
-            "<parameter=view_range>[330, 390]</parameter>\n"
+            "<parameter=path>/testbed/path/to/relevant_file.py</parameter>\n"
+            "<parameter=view_range>[1, 120]</parameter>\n"
             "</function>"
         )
     if mask["allow_validate"]:
@@ -134,12 +249,12 @@ Export the current git diff as your patch and run R2E unit-test reward. Submit o
 
 R2E_WORKFLOW_HINTS = """Search and edit strategy:
 - R2E places the repository root directly at /testbed. The current bash cwd is already /testbed. Do not assume a subdirectory named after the repository exists; use the actual paths shown by the workspace preview or by find.
-- The default bash cwd is /testbed. Do not cd into a file path such as /testbed/aiohttp/http_parser.py; cd into its directory or use the absolute file path directly.
-- For text search, include both a pattern and a real path: grep -RIn -- 'TransferEncodingError' /testbed/aiohttp | head -50. If the package path is unclear, search from the repository root with grep -RIn -- 'term' . | head -50. A command like grep -n 'term' without a file or directory will fail.
-- After search results, inspect only the relevant lines with str_replace_editor view and view_range, for example <parameter=view_range>[330, 390]</parameter>. Avoid repeatedly viewing an entire large file.
+- The default bash cwd is /testbed. Do not cd into a file path such as /testbed/path/to/relevant_file.py; cd into its directory or use the absolute file path directly.
+- For text search, include both a pattern and a real path. Start from the issue-specific grep shown in Allowed tool calls, for example grep -RIn -- '<issue keyword>' . | head -50. Then try nearby class names, function names, error names, or user-visible strings from the issue. A command like grep -n 'term' without a file or directory will fail.
+- After search results, inspect only the relevant lines with str_replace_editor view and view_range, for example <parameter=view_range>[1, 120]</parameter>. Avoid repeatedly viewing an entire large file.
 - If an observation says a command was blocked as repeated or output was clipped, change strategy immediately: narrow the path/range, search a different symbol, or inspect a different file.
 - If str_replace says old_str is not unique, do not retry the same one-line replacement. View the target range and copy a larger consecutive block into old_str.
-- Do not edit setup, install, dependency, or generated helper files unless the issue explicitly asks; fixes should usually touch source files in the package named by the issue.
+- Do not edit setup, install, dependency, or generated helper files unless the issue explicitly asks; fixes should usually touch source files related to the behavior described by the issue.
 - After a source edit, use the validate tool before submit, usually with python -m pytest -q or a focused pytest command. A failing validation is useful feedback; inspect it and revise.
 - Do not submit until at least one successful source edit and one post-edit validation command have happened, unless this is the final forced submission step.
 """
@@ -258,7 +373,7 @@ Hard constraints:
 
 {R2E_WORKFLOW_HINTS}
 
-{format_r2e_tool_mask(tool_mask, initial=True)}
+{format_r2e_tool_mask(tool_mask, task=task, initial=True)}
 
 {R2E_TOOL_SPEC}
 
@@ -313,7 +428,7 @@ Hard constraints:
 
 {R2E_WORKFLOW_HINTS}
 
-{format_r2e_tool_mask(tool_mask, final_step=(max_steps is not None and current_step >= max_steps))}
+{format_r2e_tool_mask(tool_mask, task=task, final_step=(max_steps is not None and current_step >= max_steps))}
 
 {R2E_TOOL_SPEC}
 

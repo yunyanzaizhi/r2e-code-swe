@@ -13,6 +13,7 @@ from agent_system.environments.env_package.r2e_code_swe.prompts import (
     build_step_prompt,
     format_r2e_action_for_history,
     format_r2e_history_turn,
+    issue_search_terms,
 )
 from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
 from agent_system.environments.env_package.r2e_code_swe.runtime import (
@@ -76,26 +77,32 @@ def test_prompt_never_leaks_expected_output_or_gold_patch():
     assert "SECRET_GOLD_PATCH" not in prompt
 
 
-def test_prompt_enforces_single_safe_tool_call_without_placeholders():
+def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():
     task = normalize_r2e_task_record(
         {
-            "repo_name": "aiohttp",
-            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "repo_name": "Orange3",
+            "docker_image": "namanjain12/orange3_final:abc123",
             "commit_hash": "abc123",
-            "problem_statement": "Fix chunk parser.",
+            "problem_statement": (
+                "Saving a workflow with renamed variables raises "
+                "IncompatibleContext in Orange widgets."
+            ),
         },
         "R2E-Gym/R2E-Gym-Lite",
         "dev_10pr_v1",
     )
+
+    assert issue_search_terms(task)[0] == "IncompatibleContext"
 
     prompt = build_initial_prompt(task, current_observation="Workspace ready.")
 
     assert "Your response must be exactly one XML tool call and nothing else." in prompt
     assert "<function=bash>" in prompt
     assert "<parameter=cmd>pwd && find . -maxdepth 2 -type f | head -100</parameter>" in prompt
+    assert "<parameter=cmd>grep -RIn -- 'IncompatibleContext' . | head -50</parameter>" in prompt
     assert "<function=str_replace_editor>" in prompt
     assert "<parameter=command>view</parameter>" in prompt
-    assert "<parameter=path>/testbed/aiohttp/http_parser.py</parameter>" in prompt
+    assert "<parameter=path>/testbed/path/to/relevant_file.py</parameter>" in prompt
     assert "Allowed tool calls now:" in prompt
     assert "<function=validate>" not in prompt
     assert "<function=submit></function>" not in prompt
@@ -114,16 +121,45 @@ def test_prompt_enforces_single_safe_tool_call_without_placeholders():
     assert "R2E places the repository root directly at /testbed" in prompt
     assert "Do not assume a subdirectory named after the repository exists" in prompt
     assert "Do not cd into a file path" in prompt
-    assert "grep -RIn -- 'TransferEncodingError' /testbed/aiohttp | head -50" in prompt
-    assert "<parameter=view_range>[330, 390]</parameter>" in prompt
+    assert "grep -RIn -- '<issue keyword>' . | head -50" in prompt
+    assert "<parameter=view_range>[1, 120]</parameter>" in prompt
     assert "Do not submit until at least one successful source edit" in prompt
     assert "one post-edit validation command" in prompt
     assert "python -m pytest -q" in prompt
     assert "<relevant_test>" not in prompt
     assert "```" not in prompt
     assert prompt.rstrip().endswith("Your next response must be exactly one XML tool call and nothing else.")
-    for placeholder in ("class Foo", "/testbed/path/to/file.py", "tool_name", "example.py"):
+    for fixed_example in ("aiohttp", "TransferEncodingError", "http_parser.py"):
+        assert fixed_example not in prompt
+    for placeholder in ("class Foo", "tool_name", "example.py"):
         assert placeholder not in prompt
+
+
+def test_step_prompt_uses_current_issue_search_terms_for_allowed_grep():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "Orange3",
+            "docker_image": "namanjain12/orange3_final:def456",
+            "commit_hash": "def456",
+            "problem_statement": "TypeError occurs when TableModel handles discrete metas.",
+        },
+        "R2E-Gym/R2E-Gym-Lite",
+        "dev_10pr_v1",
+    )
+
+    prompt = build_step_prompt(
+        task,
+        current_observation="Workspace ready.",
+        history_context="Previous step 1",
+        history_length=1,
+        current_step=2,
+        max_steps=5,
+    )
+
+    assert issue_search_terms(task)[0] == "TypeError"
+    assert "<parameter=cmd>grep -RIn -- 'TypeError' . | head -50</parameter>" in prompt
+    assert "grep -RIn -- 'TransferEncodingError'" not in prompt
+    assert "/testbed/aiohttp/http_parser.py" not in prompt
 
 
 def test_prompt_action_mask_exposes_validate_then_submit_by_state():
