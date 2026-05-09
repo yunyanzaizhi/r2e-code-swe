@@ -95,14 +95,44 @@ def test_focused_validation_cmd_prefers_dataset_run_tests():
     assert focused_validation_cmd(task) == "python -m pytest -q tests/test_http_parser.py::test_chunk_split"
 
 
-def test_focused_validation_cmd_uses_fail_to_pass_and_small_pass_to_pass():
+def test_focused_validation_cmd_limits_run_tests_list_to_two_commands():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+            "run_tests": [
+                "python -m pytest -q tests/test_one.py::test_a",
+                "python -m pytest -q tests/test_two.py::test_b",
+                "python -m pytest -q tests/test_three.py::test_c",
+            ],
+            "FAIL_TO_PASS": ["tests/test_http_parser.py::test_should_not_be_used"],
+        },
+        "R2E-Gym/SWE-Bench-Lite",
+        "test",
+    )
+
+    assert focused_validation_cmd(task) == (
+        "python -m pytest -q tests/test_one.py::test_a && "
+        "python -m pytest -q tests/test_two.py::test_b"
+    )
+
+
+def test_focused_validation_cmd_limits_fail_to_pass_and_small_pass_to_pass():
     task = normalize_r2e_task_record(
         {
             "repo_name": "aiohttp",
             "docker_image": "namanjain12/aiohttp_final:abc123",
             "commit_hash": "abc123",
             "problem_statement": "Fix connector limits.",
-            "FAIL_TO_PASS": ["tests/test_connector.py::test_limit", "tests/test_client.py::test_close"],
+            "FAIL_TO_PASS": [
+                "tests/test_connector.py::test_limit",
+                "tests/test_client.py::test_close",
+                "tests/test_parser.py::test_parse",
+                "tests/test_streams.py::test_stream",
+                "tests/test_extra.py::test_ignored",
+            ],
             "PASS_TO_PASS": [
                 "tests/test_connector.py::test_regression_a",
                 "tests/test_connector.py::test_regression_b",
@@ -117,6 +147,8 @@ def test_focused_validation_cmd_uses_fail_to_pass_and_small_pass_to_pass():
         "python -m pytest -q "
         "tests/test_connector.py::test_limit "
         "tests/test_client.py::test_close "
+        "tests/test_parser.py::test_parse "
+        "tests/test_streams.py::test_stream "
         "tests/test_connector.py::test_regression_a "
         "tests/test_connector.py::test_regression_b"
     )
@@ -168,6 +200,50 @@ def test_prompts_show_focused_validate_command_from_fail_to_pass():
     assert "<parameter=cmd>python -m pytest -q</parameter>" not in step_prompt
 
 
+def test_issue_search_terms_prioritizes_source_symbols_before_quotes_and_words():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "orange3",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": (
+                "When 'workflow fails on save' happens, DiscreteVariable calls "
+                "normalize_values and package.submodule.func emits ParserWarning "
+                "while ordinary description words continue."
+            ),
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+
+    assert issue_search_terms(task, max_terms=6) == [
+        "DiscreteVariable",
+        "normalize_values",
+        "package.submodule.func",
+        "ParserWarning",
+        "workflow fails on save",
+        "happens",
+    ]
+
+
+def test_issue_grep_example_uses_first_source_symbol_not_quoted_text():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "orange3",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "The text 'user visible failure' appears when DiscreteVariable unpickles values.",
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+
+    prompt = build_initial_prompt(task, current_observation="Workspace ready.")
+
+    assert "<parameter=cmd>grep -RIn -- 'DiscreteVariable' . | head -50</parameter>" in prompt
+    assert "grep -RIn -- 'user visible failure'" not in prompt
+
+
 def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():
     task = normalize_r2e_task_record(
         {
@@ -189,7 +265,7 @@ def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():
 
     assert "Your response must be exactly one XML tool call and nothing else." in prompt
     assert "<function=bash>" in prompt
-    assert "<parameter=cmd>pwd && find . -maxdepth 2 -type f | head -100</parameter>" in prompt
+    assert "<parameter=cmd>pwd && find . -maxdepth 4 -type f | head -160</parameter>" in prompt
     assert "<parameter=cmd>grep -RIn -- 'IncompatibleContext' . | head -50</parameter>" in prompt
     assert "<function=str_replace_editor>" in prompt
     assert "<parameter=command>view</parameter>" in prompt

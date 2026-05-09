@@ -114,12 +114,8 @@ def issue_search_terms(task: Optional[R2ECodeSWETask], max_terms: int = 4) -> Li
     terms: List[str] = []
     seen = set()
 
-    for match in _ISSUE_QUOTED_RE.finditer(statement):
-        quoted = next(group for group in match.groups() if group)
-        _add_issue_term(terms, seen, quoted)
-        if len(terms) >= max_terms:
-            return terms
-
+    # Source-like identifiers are best for locating code: CamelCase classes,
+    # Error/Exception/Warning names, snake_case functions, and dotted names.
     for match in _ISSUE_IDENTIFIER_RE.finditer(statement):
         token = match.group(0)
         if _looks_issue_specific_identifier(token):
@@ -127,7 +123,16 @@ def issue_search_terms(task: Optional[R2ECodeSWETask], max_terms: int = 4) -> Li
             if len(terms) >= max_terms:
                 return terms
 
-    for match in _ISSUE_WORD_RE.finditer(statement):
+    # Quoted text may be a user-visible string or log message; useful, but
+    # usually less precise than source symbols.
+    for match in _ISSUE_QUOTED_RE.finditer(statement):
+        quoted = next(group for group in match.groups() if group)
+        _add_issue_term(terms, seen, quoted)
+        if len(terms) >= max_terms:
+            return terms
+
+    unquoted_statement = _ISSUE_QUOTED_RE.sub(" ", statement)
+    for match in _ISSUE_WORD_RE.finditer(unquoted_statement):
         token = match.group(0)
         if token.lower() not in _ISSUE_STOPWORDS:
             _add_issue_term(terms, seen, token)
@@ -169,14 +174,19 @@ def _unique_strings(values: List[str]) -> List[str]:
     return unique
 
 
-def focused_validation_cmd(task: Optional[R2ECodeSWETask], max_pass_to_pass: int = 2) -> str:
+def focused_validation_cmd(
+    task: Optional[R2ECodeSWETask],
+    max_fail_to_pass: int = 4,
+    max_pass_to_pass: int = 2,
+    max_run_tests: int = 2,
+) -> str:
     test_spec = getattr(task, "test_spec", None) or {}
-    run_tests = _as_string_list(test_spec.get("run_tests"))
+    run_tests = _as_string_list(test_spec.get("run_tests"))[:max_run_tests]
     if run_tests:
         return " && ".join(run_tests)
 
     selected_tests = _unique_strings(
-        _as_string_list(test_spec.get("FAIL_TO_PASS"))
+        _as_string_list(test_spec.get("FAIL_TO_PASS"))[:max_fail_to_pass]
         + _as_string_list(test_spec.get("PASS_TO_PASS"))[:max_pass_to_pass]
     )
     if selected_tests:
@@ -206,7 +216,7 @@ def format_r2e_tool_mask(
     if mask["allow_bash"]:
         allowed.append(
             "<function=bash>\n"
-            "<parameter=cmd>pwd && find . -maxdepth 2 -type f | head -100</parameter>\n"
+            "<parameter=cmd>pwd && find . -maxdepth 4 -type f | head -160</parameter>\n"
             "</function>"
         )
         allowed.append(
