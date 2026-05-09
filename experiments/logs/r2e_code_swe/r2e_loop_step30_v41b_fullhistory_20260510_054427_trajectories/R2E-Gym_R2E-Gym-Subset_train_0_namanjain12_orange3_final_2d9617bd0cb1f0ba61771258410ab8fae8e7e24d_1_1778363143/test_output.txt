@@ -1,0 +1,56 @@
+============================= test session starts ==============================
+platform linux -- Python 3.7.9, pytest-7.4.4, pluggy-1.2.0
+rootdir: /testbed
+collected 10 items
+
+r2e_tests/test_1.py .....F....                                           [100%]
+
+=================================== FAILURES ===================================
+________ TestContextHandler.test_migrates_settings_removes_incompatible ________
+
+self = <r2e_tests.test_1.TestContextHandler testMethod=test_migrates_settings_removes_incompatible>
+
+    def test_migrates_settings_removes_incompatible(self):
+        handler = ContextHandler()
+        handler.bind(SimpleWidget)
+    
+        widget = SimpleWidget()
+    
+        contexts = [Context(foo=i) for i in (13, 13, 0, 1, 13, 2, 13)]
+    
+        def migrate_context(context, _):
+            if context.foo == 13:
+                raise IncompatibleContext()
+    
+        with patch.object(SimpleWidget, "migrate_context", migrate_context):
+>           handler.initialize(widget, dict(context_settings=contexts))
+
+r2e_tests/test_1.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+Orange/widgets/settings.py:615: in initialize
+    self._migrate_contexts(instance.context_settings)
+Orange/widgets/settings.py:628: in _migrate_contexts
+    self.widget_class.migrate_context(context, context.values.pop(VERSION_KEY, 0))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+context = <Orange.widgets.settings.Context object at 0x7fe4d6f37c50>, _ = 0
+
+    def migrate_context(context, _):
+        if context.foo == 13:
+>           raise IncompatibleContext()
+E           Orange.widgets.settings.IncompatibleContext
+
+r2e_tests/test_1.py:124: IncompatibleContext
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED r2e_tests/test_1.py::TestContextHandler::test_close_context
+PASSED r2e_tests/test_1.py::TestContextHandler::test_fast_save
+PASSED r2e_tests/test_1.py::TestContextHandler::test_find_or_create_context
+PASSED r2e_tests/test_1.py::TestContextHandler::test_initialize
+PASSED r2e_tests/test_1.py::TestContextHandler::test_initialize_migrates_contexts
+PASSED r2e_tests/test_1.py::TestContextHandler::test_pack_settings_stores_version
+PASSED r2e_tests/test_1.py::TestContextHandler::test_read_defaults
+PASSED r2e_tests/test_1.py::TestContextHandler::test_write_defaults_stores_version
+PASSED r2e_tests/test_1.py::TestSettingsPrinter::test_formats_contexts
+FAILED r2e_tests/test_1.py::TestContextHandler::test_migrates_settings_removes_incompatible
+========================= 1 failed, 9 passed in 1.16s ==========================

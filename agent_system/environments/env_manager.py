@@ -581,6 +581,7 @@ class CodeSWEEnvironmentManager(EnvironmentManagerBase):
 class R2ECodeSWEEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        self.r2e_state = []
         super().__init__(envs, projection_f, config)
 
     @staticmethod
@@ -595,10 +596,94 @@ class R2ECodeSWEEnvironmentManager(EnvironmentManagerBase):
         cfg = getattr(self.config.env.r2e_code_swe, "prompt", None)
         return getattr(cfg, name, default) if cfg is not None else default
 
+    @staticmethod
+    def _new_r2e_state():
+        return {
+            "source_candidates": [],
+            "forbidden_paths": [],
+            "selected_source_file": None,
+        }
+
+    @staticmethod
+    def _append_unique(items, value, limit=20):
+        value = "" if value is None else str(value).strip()
+        if not value or value in items:
+            return
+        items.append(value)
+        if limit > 0 and len(items) > limit:
+            del items[:-limit]
+
+    def _ensure_r2e_state(self, batch_size):
+        while len(self.r2e_state) < batch_size:
+            self.r2e_state.append(self._new_r2e_state())
+        if len(self.r2e_state) > batch_size:
+            self.r2e_state = self.r2e_state[:batch_size]
+
+    def _update_r2e_state_from_step(self, actions, infos):
+        from agent_system.environments.env_package.r2e_code_swe.reward_shaping import classify_r2e_path
+
+        self._ensure_r2e_state(len(infos))
+        max_candidates = int(self._prompt_cfg("max_source_candidates", 12))
+        max_forbidden = int(self._prompt_cfg("max_forbidden_paths", 12))
+        for idx, info in enumerate(infos):
+            state = self.r2e_state[idx]
+            candidates = info.get("path_recovery_candidates") or []
+            if isinstance(candidates, str):
+                candidates = [candidates]
+            for candidate in candidates:
+                candidate = str(candidate or "").strip()
+                if not candidate.startswith("/testbed/"):
+                    continue
+                if classify_r2e_path(candidate) != "source":
+                    continue
+                self._append_unique(state["source_candidates"], candidate, limit=max_candidates)
+
+            requested_path = str(info.get("path_recovery_requested_path") or "").strip()
+            if not requested_path:
+                action = actions[idx] if idx < len(actions) else {}
+                params = action.get("parameters") or {}
+                action_path = str(params.get("path") or "").strip()
+                if action_path and not bool(info.get("tool_execution_success", info.get("is_action_valid", True))):
+                    requested_path = action_path
+            if requested_path.startswith("/testbed/"):
+                self._append_unique(state["forbidden_paths"], requested_path, limit=max_forbidden)
+
+            edit_path = str(info.get("edit_path") or "").strip()
+            if (
+                edit_path.startswith("/testbed/")
+                and classify_r2e_path(edit_path) == "source"
+                and bool(info.get("tool_execution_success", info.get("is_action_valid", True)))
+            ):
+                state["selected_source_file"] = edit_path
+                self._append_unique(state["source_candidates"], edit_path, limit=max_candidates)
+
+    def _format_r2e_state_context(self, idx):
+        self._ensure_r2e_state(idx + 1)
+        state = self.r2e_state[idx]
+        source_candidates = state.get("source_candidates") or []
+        forbidden_paths = state.get("forbidden_paths") or []
+        lines = []
+        selected = state.get("selected_source_file")
+        if selected:
+            lines.append(f"Selected source file: {selected}")
+        lines.append("Current source candidates:")
+        if source_candidates:
+            lines.extend(f"- {path}" for path in source_candidates)
+        else:
+            lines.append("- none yet")
+        lines.append("Forbidden failed paths:")
+        if forbidden_paths:
+            lines.extend(f"- {path}" for path in forbidden_paths)
+        else:
+            lines.append("- none")
+        lines.append("Do not use forbidden paths again.")
+        return "\n".join(lines)
+
     def reset(self, kwargs):
         obs, infos = self.envs.reset(kwargs=kwargs)
         self.pre_text_obs = obs
         self.memory.reset(batch_size=len(infos))
+        self.r2e_state = [self._new_r2e_state() for _ in range(len(infos))]
         observations = {
             "text": self.build_text_obs(obs, init=True),
             "image": None,
@@ -615,6 +700,7 @@ class R2ECodeSWEEnvironmentManager(EnvironmentManagerBase):
             max_raw_chars=self._prompt_cfg("max_action_chars", 2000),
         )
         next_obs, rewards, dones, infos = self.envs.step(actions_for_env)
+        self._update_r2e_state_from_step(actions, infos)
 
         from agent_system.environments.env_package.r2e_code_swe.prompts import (
             format_r2e_action_for_history,
@@ -713,6 +799,7 @@ class R2ECodeSWEEnvironmentManager(EnvironmentManagerBase):
                     max_problem_chars=self._prompt_cfg("max_problem_chars", 6000),
                     max_observation_chars=self._prompt_cfg("max_observation_chars", 7000),
                     tool_mask=tool_mask,
+                    source_state_context=self._format_r2e_state_context(i),
                 )
             else:
                 obs = build_step_prompt(
@@ -726,6 +813,7 @@ class R2ECodeSWEEnvironmentManager(EnvironmentManagerBase):
                     max_history_chars=self._prompt_cfg("max_history_chars", 6000),
                     max_observation_chars=self._prompt_cfg("max_observation_chars", 7000),
                     tool_mask=tool_mask,
+                    source_state_context=self._format_r2e_state_context(i),
                 )
             postprocess_text_obs.append(obs)
         return postprocess_text_obs

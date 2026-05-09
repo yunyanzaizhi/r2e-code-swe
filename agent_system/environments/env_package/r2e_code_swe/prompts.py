@@ -42,7 +42,7 @@ _ISSUE_QUOTED_RE = re.compile(r"`([^`\n]{3,120})`|'([^'\n]{3,120})'|\"([^\"\n]{3
 _ISSUE_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 _ISSUE_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b")
 _VALIDATION_TEST_FILE_RE = re.compile(
-    r"(?:(?:/testbed/)|(?:\./))?((?:r2e_tests|tests)/(?:[A-Za-z0-9_.-]+/)*test_[A-Za-z0-9_.-]+\.py)"
+    r"(?:(?:/testbed/)|(?:\./))?((?:[A-Za-z0-9_.+-]+/)*(?:r2e_tests|tests)/(?:[A-Za-z0-9_.-]+/)*test_[A-Za-z0-9_.-]+\.py)"
 )
 _ISSUE_STOPWORDS = {
     "about",
@@ -187,18 +187,98 @@ def _unique_strings(values: List[str]) -> List[str]:
 
 
 def _validation_test_files_from_context(text: str) -> Dict[str, List[str]]:
-    grouped = {"r2e_tests": [], "tests": []}
+    grouped = {"r2e_tests": [], "tests": [], "all": []}
     seen = set()
     for match in _VALIDATION_TEST_FILE_RE.finditer(sanitize_prompt_text(text)):
         path = match.group(1).lstrip("./")
         if path in seen:
             continue
         seen.add(path)
-        if path.startswith("r2e_tests/"):
+        grouped["all"].append(path)
+        if path.startswith("r2e_tests/") or "/r2e_tests/" in path:
             grouped["r2e_tests"].append(path)
         elif path.startswith("tests/"):
             grouped["tests"].append(path)
     return grouped
+
+
+def _split_pytest_target(target: str) -> tuple:
+    text = str(target or "").strip()
+    if "::" in text:
+        path, suffix = text.split("::", 1)
+        return path, "::" + suffix
+    return text, ""
+
+
+def _rank_validation_candidate(path: str) -> tuple:
+    lower = path.lower()
+    if path.startswith("r2e_tests/") or "/r2e_tests/" in path:
+        return (0, len(path), path)
+    if path.startswith("tests/"):
+        return (1, len(path), path)
+    if "/tests/" in path:
+        return (2, len(path), path)
+    return (3, len(path), path)
+
+
+def _resolve_validation_target_from_context(target: str, context_tests: Dict[str, List[str]]) -> Optional[str]:
+    path, suffix = _split_pytest_target(target)
+    clean_path = path.removeprefix("/testbed/").lstrip("./")
+    if not clean_path.endswith(".py"):
+        return target
+    if clean_path.startswith("r2e_tests/"):
+        return clean_path + suffix
+    if not clean_path.startswith("tests/"):
+        return clean_path + suffix
+
+    all_context_tests = context_tests.get("all") or []
+    if clean_path in all_context_tests:
+        return clean_path + suffix
+
+    basename = clean_path.rsplit("/", 1)[-1]
+    candidates = [candidate for candidate in all_context_tests if candidate.rsplit("/", 1)[-1] == basename]
+    if not candidates:
+        return None
+    candidates.sort(key=_rank_validation_candidate)
+    return candidates[0] + suffix
+
+
+def _find_based_validation_cmd(target: str) -> str:
+    path, suffix = _split_pytest_target(target)
+    clean_path = path.removeprefix("/testbed/").lstrip("./")
+    basename = clean_path.rsplit("/", 1)[-1]
+    suffix_q = _shell_single_quote(suffix)
+    exact_q = _shell_single_quote(clean_path)
+    find_pattern_q = _shell_single_quote(f"*{basename}")
+    missing_q = _shell_single_quote(f"No focused test file found for {basename}")
+    return (
+        f"target=$(if [ -f {exact_q} ]; then printf '%s\\n' {exact_q}; "
+        f"else find . -path {find_pattern_q} -type f | head -1; fi); "
+        f'test -n "$target" && python -m pytest -q "${{target#./}}"{suffix_q} '
+        f"|| {{ echo {missing_q}; exit 1; }}"
+    )
+
+
+def _focused_pytest_cmd_for_targets(targets: List[str], validation_context: str = "") -> Optional[str]:
+    context_tests = _validation_test_files_from_context(validation_context)
+    resolved: List[str] = []
+    unresolved_root_tests: List[str] = []
+    for target in _unique_strings(targets):
+        path, _ = _split_pytest_target(target)
+        clean_path = path.removeprefix("/testbed/").lstrip("./")
+        resolved_target = _resolve_validation_target_from_context(target, context_tests)
+        if resolved_target:
+            resolved.append(resolved_target)
+        elif clean_path.startswith("tests/") and clean_path.endswith(".py"):
+            unresolved_root_tests.append(target)
+
+    if resolved:
+        return "python -m pytest -q " + " ".join(shlex.quote(test) for test in resolved)
+    if context_tests["r2e_tests"]:
+        return "python -m pytest -q " + shlex.quote(context_tests["r2e_tests"][0])
+    if unresolved_root_tests and (not validation_context.strip() or not context_tests["all"]):
+        return _find_based_validation_cmd(unresolved_root_tests[0])
+    return None
 
 
 def focused_validation_cmd(
@@ -218,7 +298,9 @@ def focused_validation_cmd(
         + _as_string_list(test_spec.get("PASS_TO_PASS"))[:max_pass_to_pass]
     )
     if selected_tests:
-        return "python -m pytest -q " + " ".join(shlex.quote(test) for test in selected_tests)
+        focused_cmd = _focused_pytest_cmd_for_targets(selected_tests, validation_context=validation_context)
+        if focused_cmd:
+            return focused_cmd
 
     context_tests = _validation_test_files_from_context(validation_context)
     if context_tests["r2e_tests"]:
@@ -273,12 +355,17 @@ def format_r2e_tool_mask(
             "</function>"
         )
     else:
-        masked.append("validate: available after a successful source edit; use bash or str_replace_editor first.")
+        masked.append("validate: unavailable until a successful source edit has been made.")
     if mask["allow_submit"]:
         allowed.append("<function=submit></function>")
     else:
         if mask["submit_reason"] == "requires_validation_after_source_edit":
             masked.append("submit: available after a validation command has run after the latest source edit.")
+        elif mask["submit_reason"] == "requires_passing_validation_after_source_edit":
+            masked.append(
+                "submit: blocked because the latest validation command is failing. "
+                "Fix or undo the edit, then run focused validation until it exits 0."
+            )
         else:
             masked.append("submit: available after a successful source edit and validation; do not submit yet.")
 
@@ -317,7 +404,7 @@ For insert include named parameter=insert_line and named parameter=new_str.
 
 3. validate
 Run a focused validation command inside the R2E Docker workspace after a successful source edit.
-Required parameter: cmd. Prefer the Recommended focused validate command shown in this prompt. The command must be test-like, for example python -m pytest -q tests/test_file.py::test_name, pytest -q, tox, unittest, r2e_tests, or run_tests.
+Required parameter: cmd. Prefer the focused validate command when the prompt shows one. The command must be test-like, for example python -m pytest -q tests/test_file.py::test_name, pytest -q, tox, unittest, r2e_tests, or run_tests.
 A failing validation command still counts as useful feedback. Inspect the output and revise before submitting.
 
 4. submit
@@ -332,7 +419,7 @@ R2E_WORKFLOW_HINTS = """Search and edit strategy:
 - If an observation says a command was blocked as repeated or output was clipped, change strategy immediately: narrow the path/range, search a different symbol, or inspect a different file.
 - If str_replace says old_str is not unique, do not retry the same one-line replacement. View the target range and copy a larger consecutive block into old_str.
 - Do not edit setup, install, dependency, or generated helper files unless the issue explicitly asks; fixes should usually touch source files related to the behavior described by the issue.
-- After a source edit, use the validate tool before submit, usually with the recommended focused validate command shown below. A failing validation is useful feedback; inspect it and revise.
+- After a source edit, use the validate tool before submit, usually with the focused validate command shown when validate is available. A failing validation is useful feedback; inspect it and revise.
 - Do not submit until at least one successful source edit and one post-edit validation command have happened, unless this is the final forced submission step.
 """
 
@@ -370,6 +457,25 @@ def clip_text(text: str, max_chars: int, label: str = "text") -> str:
         text[:keep]
         + f"\n--- <{label} clipped; inspect a narrower file range or command output> ---\n"
         + text[-keep:]
+    )
+
+
+def _validation_guidance(
+    tool_mask: Optional[Dict[str, Any]],
+    *,
+    task: Optional[R2ECodeSWETask],
+    validation_context: str,
+    initial: bool = False,
+    final_step: bool = False,
+) -> str:
+    mask = _normalize_tool_mask(tool_mask, initial=initial)
+    if final_step:
+        mask["allow_validate"] = False
+    if mask["allow_validate"]:
+        return f"Recommended focused validate command: {focused_validation_cmd(task, validation_context=validation_context)}"
+    return (
+        "Validation is currently unavailable because no successful source edit has been made.\n"
+        "Your next action must be bash or str_replace_editor."
     )
 
 
@@ -426,7 +532,14 @@ def build_initial_prompt(
     max_problem_chars: int = 6000,
     max_observation_chars: int = 7000,
     tool_mask: Optional[Dict[str, Any]] = None,
+    source_state_context: str = "",
 ) -> str:
+    validation_guidance = _validation_guidance(
+        tool_mask,
+        task=task,
+        validation_context=current_observation,
+        initial=True,
+    )
     return f"""{R2E_ACTION_PROTOCOL}
 At the first step, use bash to inspect the repository. Do not submit before inspecting files.
 
@@ -450,7 +563,9 @@ Hard constraints:
 
 {R2E_WORKFLOW_HINTS}
 
-Recommended focused validate command: {focused_validation_cmd(task, validation_context=current_observation)}
+{validation_guidance}
+
+{source_state_context}
 
 {format_r2e_tool_mask(tool_mask, task=task, validation_context=current_observation, initial=True)}
 
@@ -477,6 +592,7 @@ def build_step_prompt(
     max_history_chars: int = 6000,
     max_observation_chars: int = 7000,
     tool_mask: Optional[Dict[str, Any]] = None,
+    source_state_context: str = "",
 ) -> str:
     final_step_instruction = ""
     if max_steps is not None and current_step >= max_steps:
@@ -486,6 +602,12 @@ def build_step_prompt(
             "<function=submit></function>\n\n"
         )
     validation_context = "\n".join([history_context or "", current_observation or ""])
+    validation_guidance = _validation_guidance(
+        tool_mask,
+        task=task,
+        validation_context=validation_context,
+        final_step=(max_steps is not None and current_step >= max_steps),
+    )
     return f"""{R2E_ACTION_PROTOCOL}
 {final_step_instruction}\
 You are a repository-level software engineering agent running inside an R2E-Gym Docker environment.
@@ -508,7 +630,9 @@ Hard constraints:
 
 {R2E_WORKFLOW_HINTS}
 
-Recommended focused validate command: {focused_validation_cmd(task, validation_context=validation_context)}
+{validation_guidance}
+
+{source_state_context}
 
 {format_r2e_tool_mask(tool_mask, task=task, validation_context=validation_context, final_step=(max_steps is not None and current_step >= max_steps))}
 

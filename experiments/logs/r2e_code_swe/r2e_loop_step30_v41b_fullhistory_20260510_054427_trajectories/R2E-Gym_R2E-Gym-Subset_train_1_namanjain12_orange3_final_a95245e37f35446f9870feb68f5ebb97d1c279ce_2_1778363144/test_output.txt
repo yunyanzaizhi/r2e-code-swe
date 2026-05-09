@@ -1,0 +1,91 @@
+============================= test session starts ==============================
+platform linux -- Python 3.7.9, pytest-7.4.4, pluggy-1.2.0
+rootdir: /testbed
+collected 55 items
+
+r2e_tests/test_1.py .................F.................................. [ 94%]
+...                                                                      [100%]
+
+=================================== FAILURES ===================================
+______________________ TestDiscreteVariable.test_unpickle ______________________
+
+self = <r2e_tests.test_1.TestDiscreteVariable testMethod=test_unpickle>
+
+    def test_unpickle(self):
+        d1 = DiscreteVariable("A", values=["two", "one"])
+        s = pickle.dumps(d1)
+        d2 = DiscreteVariable.make("A", values=["one", "two", "three"])
+        d2_values = tuple(d2.values)
+        d1c = pickle.loads(s)
+        # See: gh-3238
+        # The unpickle reconstruction picks an existing variable (d2), on which
+        # __setstate__ or __dict__.update is called
+>       self.assertSequenceEqual(d2.values, d2_values)
+E       AssertionError: Sequences differ: ['two', 'one'] != ('two', 'one', 'three')
+E       
+E       Second sequence contains 1 additional elements.
+E       First extra element 2:
+E       'three'
+E       
+E       - ['two', 'one']
+E       + ('two', 'one', 'three')
+
+r2e_tests/test_1.py:278: AssertionError
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED r2e_tests/test_1.py::TestVariable::test_name
+PASSED r2e_tests/test_1.py::TestVariable::test_properties
+PASSED r2e_tests/test_1.py::TestVariable::test_properties_as_predicates
+PASSED r2e_tests/test_1.py::TestVariable::test_repr_is_abstract
+PASSED r2e_tests/test_1.py::TestVariable::test_strange_eq
+PASSED r2e_tests/test_1.py::TestVariable::test_to_val
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_colors
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_copy_copies_attributes
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_dont_make_anonymous_variables
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_dont_pickle_anonymous_variables
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_dont_store_anonymous_variables
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_find_compatible_ordered
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_find_compatible_unordered
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_make
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_no_nonstringvalues
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_repr
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_to_val
+PASSED r2e_tests/test_1.py::TestDiscreteVariable::test_val_from_str
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_adjust_decimals
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_colors
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_copy_copies_attributes
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_decimals
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_dont_make_anonymous_variables
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_dont_pickle_anonymous_variables
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_dont_store_anonymous_variables
+PASSED r2e_tests/test_1.py::TestContinuousVariable::test_make
+PASSED r2e_tests/test_1.py::TestStringVariable::test_copy_copies_attributes
+PASSED r2e_tests/test_1.py::TestStringVariable::test_dont_make_anonymous_variables
+PASSED r2e_tests/test_1.py::TestStringVariable::test_dont_pickle_anonymous_variables
+PASSED r2e_tests/test_1.py::TestStringVariable::test_dont_store_anonymous_variables
+PASSED r2e_tests/test_1.py::TestStringVariable::test_val
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_copy_copies_attributes
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_dont_make_anonymous_variables
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_dont_pickle_anonymous_variables
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_dont_store_anonymous_variables
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_have_date
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_have_date_have_time_in_construct
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_no_date_no_time
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_parse_invalid
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_parse_repr
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_parse_timestamp
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_parse_utc
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_readwrite_timevariable
+PASSED r2e_tests/test_1.py::TestTimeVariable::test_repr_value
+PASSED r2e_tests/test_1.py::PickleContinuousVariable::test_with_name
+PASSED r2e_tests/test_1.py::PickleDiscreteVariable::test_ordered
+PASSED r2e_tests/test_1.py::PickleDiscreteVariable::test_with_base_value
+PASSED r2e_tests/test_1.py::PickleDiscreteVariable::test_with_name
+PASSED r2e_tests/test_1.py::PickleDiscreteVariable::test_with_str_value
+PASSED r2e_tests/test_1.py::PickleStringVariable::test_with_name
+PASSED r2e_tests/test_1.py::VariableTestMakeProxy::test_make_proxy_cont
+PASSED r2e_tests/test_1.py::VariableTestMakeProxy::test_make_proxy_disc
+PASSED r2e_tests/test_1.py::VariableTestMakeProxy::test_proxy_has_separate_attributes
+PASSED r2e_tests/test_1.py::VariableTestMakeProxy::test_proxy_has_separate_colors
+FAILED r2e_tests/test_1.py::TestDiscreteVariable::test_unpickle - AssertionEr...
+========================= 1 failed, 54 passed in 1.33s =========================

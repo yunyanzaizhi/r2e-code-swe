@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -50,6 +51,7 @@ class R2ECodeSWEEnv(gym.Env):
         auto_submit_on_max_steps: bool = True,
         require_successful_edit_before_submit: bool = True,
         require_validation_before_submit: bool = True,
+        require_passing_validation_before_submit: bool = True,
         max_repeated_failed_actions: int = 1,
         max_repeated_failed_action_blocks: int = 3,
         max_repeated_no_progress_actions: int = 3,
@@ -70,6 +72,7 @@ class R2ECodeSWEEnv(gym.Env):
         self.auto_submit_on_max_steps = auto_submit_on_max_steps
         self.require_successful_edit_before_submit = require_successful_edit_before_submit
         self.require_validation_before_submit = require_validation_before_submit
+        self.require_passing_validation_before_submit = require_passing_validation_before_submit
         self.max_repeated_failed_actions = max_repeated_failed_actions
         self.max_repeated_failed_action_blocks = max_repeated_failed_action_blocks
         self.max_repeated_no_progress_actions = max_repeated_no_progress_actions
@@ -85,6 +88,7 @@ class R2ECodeSWEEnv(gym.Env):
         self.successful_edit_counts: List[int] = []
         self.successful_source_edit_counts: List[int] = []
         self.validation_after_source_edit_counts: List[int] = []
+        self.last_validation_exit_codes: List[Optional[str]] = []
         self.reward_shaping_states: List[R2ERewardShapingState] = []
         self.last_failed_action_signatures: List[Optional[str]] = []
         self.repeated_failed_action_counts: List[int] = []
@@ -101,6 +105,7 @@ class R2ECodeSWEEnv(gym.Env):
         self.successful_edit_counts = [0 for _ in range(self.num_processes)]
         self.successful_source_edit_counts = [0 for _ in range(self.num_processes)]
         self.validation_after_source_edit_counts = [0 for _ in range(self.num_processes)]
+        self.last_validation_exit_codes = [None for _ in range(self.num_processes)]
         self.reward_shaping_states = [self.reward_shaping_config.new_state() for _ in range(self.num_processes)]
         self.last_failed_action_signatures = [None for _ in range(self.num_processes)]
         self.repeated_failed_action_counts = [0 for _ in range(self.num_processes)]
@@ -278,8 +283,22 @@ class R2ECodeSWEEnv(gym.Env):
         )
         has_source_edit = source_edits > 0
         has_required_validation = (not self.require_validation_before_submit) or validations > 0
+        last_validation_exit_code = (
+            self.last_validation_exit_codes[idx]
+            if idx < len(getattr(self, "last_validation_exit_codes", []))
+            else None
+        )
+        has_passing_validation = (
+            (not self.require_passing_validation_before_submit)
+            or (not self.require_validation_before_submit)
+            or (validations > 0 and str(last_validation_exit_code) == "0")
+        )
         allow_validate = has_source_edit
-        allow_submit = (not self.require_successful_edit_before_submit or has_source_edit) and has_required_validation
+        allow_submit = (
+            (not self.require_successful_edit_before_submit or has_source_edit)
+            and has_required_validation
+            and has_passing_validation
+        )
 
         allowed_tools = ["bash", "str_replace_editor"]
         masked_tools: Dict[str, str] = {}
@@ -293,6 +312,14 @@ class R2ECodeSWEEnv(gym.Env):
         elif has_source_edit and self.require_validation_before_submit and validations <= 0:
             masked_tools["submit"] = "requires_validation_after_source_edit"
             submit_reason = "requires_validation_after_source_edit"
+        elif (
+            has_source_edit
+            and self.require_passing_validation_before_submit
+            and validations > 0
+            and str(last_validation_exit_code) != "0"
+        ):
+            masked_tools["submit"] = "requires_passing_validation_after_source_edit"
+            submit_reason = "requires_passing_validation_after_source_edit"
         else:
             masked_tools["submit"] = "requires_successful_source_edit_and_validation"
             submit_reason = "requires_successful_source_edit_and_validation"
@@ -308,6 +335,8 @@ class R2ECodeSWEEnv(gym.Env):
             "submit_reason": submit_reason,
             "successful_source_edit_count": source_edits,
             "validation_after_source_edit_count": validations,
+            "last_validation_exit_code": last_validation_exit_code,
+            "require_passing_validation_before_submit": self.require_passing_validation_before_submit,
         }
 
     def _edit_command_succeeded(self, action: Dict[str, Any], result: R2EToolResult) -> bool:
@@ -323,17 +352,24 @@ class R2ECodeSWEEnv(gym.Env):
     def _source_edit_command_succeeded(self, action: Dict[str, Any], result: R2EToolResult) -> bool:
         if not self._edit_command_succeeded(action, result):
             return False
+        if result.info.get("semantic_noop_edit"):
+            return False
         path = str((action.get("parameters") or {}).get("path") or "")
         return classify_r2e_path(path) == "source"
 
     def _record_action_result(self, idx: int, action: Dict[str, Any], result: R2EToolResult) -> None:
+        while len(getattr(self, "last_validation_exit_codes", [])) <= idx:
+            self.last_validation_exit_codes.append(None)
         if self._edit_command_succeeded(action, result):
             self.successful_edit_counts[idx] += 1
         if self._source_edit_command_succeeded(action, result):
             self.successful_source_edit_counts[idx] += 1
+            self.validation_after_source_edit_counts[idx] = 0
+            self.last_validation_exit_codes[idx] = None
 
         if self._validation_command_after_source_edit(idx, action, result):
             self.validation_after_source_edit_counts[idx] += 1
+            self.last_validation_exit_codes[idx] = str(result.info.get("exit_code"))
 
         execution_success = bool(result.info.get("tool_execution_success", result.is_action_valid))
         if result.is_action_valid and execution_success:
@@ -358,12 +394,67 @@ class R2ECodeSWEEnv(gym.Env):
             return False
         if self.successful_source_edit_counts[idx] <= 0:
             return False
+        if result.info.get("large_validation_failure_after_edit"):
+            return False
         command = str((action.get("parameters") or {}).get("cmd") or "")
         if not is_validation_command(command):
             return False
         # A failing test command is still useful validation feedback. Count only
         # commands that reached the R2E bash runtime, not adapter-side blocks.
         return result.is_action_valid and "exit_code" in result.info
+
+    def _validation_failure_count(self, result: R2EToolResult) -> int:
+        text_parts = [
+            result.observation,
+            str(result.info.get("stdout") or ""),
+            str(result.info.get("stderr") or ""),
+        ]
+        text = "\n".join(text_parts)
+        counts = [
+            int(match.group(1))
+            for match in re.finditer(r"\b(\d+)\s+(?:failed|failures?|errors?)\b", text, flags=re.IGNORECASE)
+        ]
+        failed_line_count = sum(
+            1
+            for line in text.splitlines()
+            if line.startswith("FAILED ") or line.startswith("ERROR ")
+        )
+        if failed_line_count:
+            counts.append(failed_line_count)
+        return max(counts) if counts else 0
+
+    def _annotate_large_validation_failure_after_edit(
+        self,
+        idx: int,
+        action: Dict[str, Any],
+        result: R2EToolResult,
+    ) -> R2EToolResult:
+        if action.get("tool_name") not in {"bash", "validate"}:
+            return result
+        if self.successful_source_edit_counts[idx] <= 0:
+            return result
+        command = str((action.get("parameters") or {}).get("cmd") or "")
+        if not is_validation_command(command):
+            return result
+        if bool(result.info.get("tool_execution_success", result.is_action_valid)):
+            return result
+        failure_count = self._validation_failure_count(result)
+        if failure_count < 3:
+            return result
+        message = (
+            "\n[validation warning] Focused validation produced many failures after your edit. "
+            "Use str_replace_editor undo_edit or fix the edit, then run a focused validation again. "
+            "Do not submit this patch yet."
+        )
+        result.observation += message
+        result.info.update(
+            {
+                "large_validation_failure_after_edit": True,
+                "validation_failure_count": failure_count,
+                "validation_recovery_hint": "undo_or_fix_before_submit",
+            }
+        )
+        return result
 
     def _repeated_no_progress_block(self, idx: int, action: Dict[str, Any]) -> Optional[R2EToolResult]:
         signature = self._no_progress_action_signature(idx, action)
@@ -445,6 +536,8 @@ class R2ECodeSWEEnv(gym.Env):
             return None
         if self._submit_requires_validation(idx, action):
             return self._blocked_submit_before_validation(repeated=True)
+        if self._submit_requires_passing_validation(idx, action):
+            return self._blocked_submit_before_passing_validation(idx, repeated=True)
         if self._validate_requires_source_edit(idx, action):
             return self._blocked_validate_before_source_edit(repeated=True)
         block_count = max(1, self.repeated_failed_action_counts[idx] - self.max_repeated_failed_actions + 1)
@@ -543,6 +636,21 @@ class R2ECodeSWEEnv(gym.Env):
             and self.validation_after_source_edit_counts[idx] <= 0
         )
 
+    def _submit_requires_passing_validation(self, idx: int, action: Dict[str, Any]) -> bool:
+        last_exit_code = (
+            self.last_validation_exit_codes[idx]
+            if idx < len(getattr(self, "last_validation_exit_codes", []))
+            else None
+        )
+        return (
+            action.get("tool_name") == "submit"
+            and self.require_validation_before_submit
+            and self.require_passing_validation_before_submit
+            and self.successful_source_edit_counts[idx] > 0
+            and self.validation_after_source_edit_counts[idx] > 0
+            and str(last_exit_code) != "0"
+        )
+
     def _blocked_submit_before_validation(self, repeated: bool = False) -> R2EToolResult:
         prefix = "Submit still blocked" if repeated else "Submit blocked"
         message = (
@@ -563,6 +671,31 @@ class R2ECodeSWEEnv(gym.Env):
                 "repeated_submit_before_validation": bool(repeated),
                 "tool_execution_success": False,
                 "tool_execution_fail_reason": "submit_before_validation_after_source_edit",
+            },
+        )
+
+    def _blocked_submit_before_passing_validation(self, idx: int, repeated: bool = False) -> R2EToolResult:
+        last_exit_code = (
+            self.last_validation_exit_codes[idx]
+            if idx < len(getattr(self, "last_validation_exit_codes", []))
+            else None
+        )
+        prefix = "Submit still blocked" if repeated else "Submit blocked"
+        message = (
+            f"{prefix}: the latest validation command is still failing "
+            f"(exit code {last_exit_code}). Inspect the validation output, undo_edit or repair the source edit, "
+            "then run focused validation again. Submit is available before the final step only after validation exits 0."
+        )
+        return R2EToolResult(
+            message,
+            is_action_valid=True,
+            info={
+                "fail_reason": "submit_before_passing_validation_after_source_edit",
+                "stderr": message,
+                "last_validation_exit_code": last_exit_code,
+                "repeated_submit_before_passing_validation": bool(repeated),
+                "tool_execution_success": False,
+                "tool_execution_fail_reason": "submit_before_passing_validation_after_source_edit",
             },
         )
 
@@ -639,7 +772,8 @@ class R2ECodeSWEEnv(gym.Env):
         tool_name = action["tool_name"]
         params = action.get("parameters") or {}
         if tool_name == "bash":
-            return runtime.run_bash(params.get("cmd", ""), cwd=params.get("cwd"))
+            result = runtime.run_bash(params.get("cmd", ""), cwd=params.get("cwd"))
+            return self._annotate_large_validation_failure_after_edit(idx, action, result)
         if tool_name == "validate":
             command = str(params.get("cmd") or "")
             if self._validate_requires_source_edit(idx, action):
@@ -649,7 +783,7 @@ class R2ECodeSWEEnv(gym.Env):
             result = runtime.run_bash(command, cwd=params.get("cwd"))
             result.info["validation_action"] = True
             result.info["validation_cmd"] = command
-            return result
+            return self._annotate_large_validation_failure_after_edit(idx, action, result)
         if tool_name == "str_replace_editor":
             path = str(params.get("path") or "")
             path_kind = classify_r2e_path(path)
@@ -686,6 +820,8 @@ class R2ECodeSWEEnv(gym.Env):
                 )
             if not getattr(runtime, "setup_error", None) and self._submit_requires_validation(idx, action):
                 return self._blocked_submit_before_validation()
+            if not getattr(runtime, "setup_error", None) and self._submit_requires_passing_validation(idx, action):
+                return self._blocked_submit_before_passing_validation(idx)
             return runtime.submit()
         message = f"Invalid action: unknown tool '{tool_name}'."
         return R2EToolResult(message, is_action_valid=False, info={"fail_reason": "unknown_tool", "stderr": message})
@@ -766,6 +902,11 @@ class R2ECodeSWEEnv(gym.Env):
                 if idx < len(self.validation_after_source_edit_counts)
                 else 0
             ),
+            "last_validation_exit_code": (
+                self.last_validation_exit_codes[idx]
+                if idx < len(getattr(self, "last_validation_exit_codes", []))
+                else None
+            ),
             "action_mask": self.action_mask(idx) if idx < len(getattr(self, "current_tasks", [])) else {},
         }
 
@@ -806,6 +947,9 @@ def build_r2e_code_swe_envs(
         auto_submit_on_max_steps=bool(getattr(r2e_config, "auto_submit_on_max_steps", True)),
         require_successful_edit_before_submit=bool(getattr(r2e_config, "require_successful_edit_before_submit", True)),
         require_validation_before_submit=bool(getattr(r2e_config, "require_validation_before_submit", True)),
+        require_passing_validation_before_submit=bool(
+            getattr(r2e_config, "require_passing_validation_before_submit", True)
+        ),
         max_repeated_failed_actions=int(getattr(r2e_config, "max_repeated_failed_actions", 1)),
         max_repeated_failed_action_blocks=int(getattr(r2e_config, "max_repeated_failed_action_blocks", 3)),
         max_repeated_no_progress_actions=int(getattr(r2e_config, "max_repeated_no_progress_actions", 3)),

@@ -113,6 +113,58 @@ def _unescape_editor_text_literal(value: Any) -> Any:
     return value.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
 
 
+def _is_python_source_edit(params: Dict[str, Any]) -> bool:
+    command = str((params or {}).get("command") or "")
+    path = str((params or {}).get("path") or "")
+    if command not in {"create", "str_replace", "insert"}:
+        return False
+    if not path.endswith(".py"):
+        return False
+    return classify_r2e_path(path) == "source"
+
+
+def _split_import_names(import_body: str) -> List[str]:
+    names: List[str] = []
+    body = str(import_body or "")
+    body = re.sub(r"#.*", "", body)
+    body = body.replace("(", " ").replace(")", " ").replace("\\", " ")
+    for raw_name in body.split(","):
+        name = raw_name.strip()
+        if not name:
+            continue
+        name = re.split(r"\s+as\s+", name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        name = name.strip(".")
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", name):
+            names.append(name.split(".")[-1])
+    return names
+
+
+def _imported_names(text: Any) -> List[str]:
+    source = str(text or "")
+    if not source.strip():
+        return []
+    compact = re.sub(r"\\\s*\n", " ", source)
+    names: List[str] = []
+    for match in re.finditer(
+        r"(?ms)^\s*from\s+[A-Za-z_][A-Za-z0-9_.]*\s+import\s+(\([^)]*\)|[^\n]+)",
+        compact,
+    ):
+        names.extend(_split_import_names(match.group(1)))
+    for match in re.finditer(r"(?m)^\s*import\s+([^\n]+)", compact):
+        names.extend(_split_import_names(match.group(1)))
+    return sorted(set(names))
+
+
+def _removed_import_names(params: Dict[str, Any]) -> List[str]:
+    if str((params or {}).get("command") or "") != "str_replace":
+        return []
+    old_names = set(_imported_names((params or {}).get("old_str")))
+    if not old_names:
+        return []
+    new_names = set(_imported_names((params or {}).get("new_str")))
+    return sorted(old_names - new_names)
+
+
 def _safe_name(text: str, max_len: int = 120) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text))[:max_len] or "unknown"
 
@@ -806,7 +858,196 @@ print(json.dumps({{
             return retry_text, retry_code_s
         return None
 
-    def _try_literal_newline_repair(self, params: Dict[str, Any], output_text: str) -> Optional[R2EToolResult]:
+    def _semantic_noop_check_command(self, params: Dict[str, Any]) -> str:
+        payload = base64.b64encode(
+            json.dumps(
+                {
+                    "path": str(params.get("path") or ""),
+                    "command": str(params.get("command") or ""),
+                    "old_str": str(params.get("old_str") or ""),
+                    "new_str": str(params.get("new_str") or ""),
+                    "file_text": str(params.get("file_text") or ""),
+                }
+            ).encode("utf-8")
+        ).decode("ascii")
+        script = f"""# R2E_SEMANTIC_SNAPSHOT
+import ast, base64, json
+from pathlib import Path
+
+payload = json.loads(base64.b64decode({json.dumps(payload)}).decode("utf-8"))
+path = Path(payload["path"])
+command = payload.get("command") or ""
+old_str = payload.get("old_str") or ""
+new_str = payload.get("new_str") or ""
+file_text = payload.get("file_text") or ""
+
+def ast_dump(text):
+    try:
+        return ast.dump(ast.parse(text), include_attributes=False)
+    except SyntaxError:
+        return None
+
+def snippet_noop(before, after):
+    before_dump = ast_dump(before)
+    after_dump = ast_dump(after)
+    return bool(before_dump and after_dump and before_dump == after_dump)
+
+try:
+    content = path.read_text(encoding="utf-8", errors="surrogateescape")
+    content_dump = ast_dump(content)
+    semantic_noop = False
+    reason = None
+    if command == "str_replace":
+        before_content = None
+        if new_str and new_str in content:
+            before_content = content.replace(new_str, old_str, 1)
+        if before_content is not None:
+            before_dump = ast_dump(before_content)
+            if before_dump and content_dump and before_dump == content_dump:
+                semantic_noop = True
+                reason = "ast_dump_equal"
+        if not semantic_noop and snippet_noop(old_str, new_str):
+            semantic_noop = True
+            reason = "ast_dump_equal"
+    elif command == "insert":
+        inserted_dump = ast_dump(new_str)
+        if inserted_dump == ast.dump(ast.Module(body=[], type_ignores=[]), include_attributes=False):
+            semantic_noop = True
+            reason = "inserted_ast_empty"
+    elif command == "create" and file_text and snippet_noop("", file_text):
+        semantic_noop = True
+        reason = "created_ast_empty"
+    print(json.dumps({{"ok": True, "semantic_noop": semantic_noop, "reason": reason}}))
+except Exception as exc:
+    print(json.dumps({{"ok": False, "error": f"{{type(exc).__name__}}: {{exc}}"}}))
+"""
+        return "bash -lc " + shlex.quote("python3 - <<'PY'\n" + script + "\nPY")
+
+    def _semantic_noop_check(self, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not _is_python_source_edit(params):
+            return None
+        output, code = self.env.runtime.run(
+            self._semantic_noop_check_command(params),
+            timeout=self.config.command_timeout,
+            workdir="/testbed",
+        )
+        if str(code) != "0":
+            return None
+        try:
+            data = json.loads(str(output or "{}"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or not data.get("ok") or not data.get("semantic_noop"):
+            return None
+        return {"reason": str(data.get("reason") or "ast_dump_equal")}
+
+    def _postprocess_python_source_edit(
+        self,
+        params: Dict[str, Any],
+        output_text: str,
+        execution_success: bool,
+        fail_reason: Optional[str],
+    ) -> Tuple[str, bool, Optional[str], Dict[str, Any]]:
+        info: Dict[str, Any] = {}
+        if not execution_success or not _is_python_source_edit(params):
+            return output_text, execution_success, fail_reason, info
+
+        removed_names = _removed_import_names(params)
+        if len(removed_names) >= 2:
+            output_text += (
+                "\n[post-edit warning] High-risk import edit: removed multiple imported names: "
+                f"{', '.join(removed_names)}. Run focused validation and consider undo_edit if failures are broad."
+            )
+            info.update(
+                {
+                    "import_block_high_risk": True,
+                    "removed_import_names": removed_names,
+                }
+            )
+
+        path = str(params.get("path") or "")
+        compile_command = "python -m py_compile " + shlex.quote(path)
+        compile_output, compile_code = self.env.runtime.run(
+            compile_command,
+            timeout=self.config.command_timeout,
+            workdir="/testbed",
+        )
+        compile_code_s = str(compile_code)
+        compile_text = str(compile_output or "")
+        info.update(
+            {
+                "py_compile_command": compile_command,
+                "py_compile_exit_code": compile_code_s,
+                "py_compile_output": clip_text(compile_text, self.config.max_output_chars, "py_compile output"),
+            }
+        )
+        if compile_code_s != "0":
+            output_text += (
+                f"\n[post-edit check] py_compile failed for {path}. "
+                "Use str_replace_editor undo_edit or fix the syntax before continuing; "
+                "this edit will not count as a successful source edit."
+            )
+            if compile_text.strip():
+                output_text += "\n" + clip_text(compile_text, self.config.max_output_chars, "py_compile output")
+            info["py_compile_failed"] = True
+            return output_text, False, "py_compile_failed", info
+
+        info["py_compile_success"] = True
+        semantic_noop = self._semantic_noop_check(params)
+        if semantic_noop:
+            output_text += (
+                "\n[post-edit check] semantic no-op edit detected: Python AST dump is unchanged. "
+                "This looks like quote, whitespace, comment, or unrelated formatting only; "
+                "it will not count as a successful source edit, so validate/submit remain unavailable."
+            )
+            info.update(
+                {
+                    "semantic_noop_edit": True,
+                    "semantic_noop_reason": semantic_noop.get("reason") or "ast_dump_equal",
+                    "semantic_noop_ast_dump_equal": semantic_noop.get("reason") == "ast_dump_equal",
+                }
+            )
+        return output_text, execution_success, fail_reason, info
+
+    def _editor_result(
+        self,
+        params: Dict[str, Any],
+        output_text: str,
+        code_s: str,
+        execution_success: bool,
+        fail_reason: Optional[str],
+        extra_info: Optional[Dict[str, Any]] = None,
+    ) -> R2EToolResult:
+        extra = dict(extra_info or {})
+        if execution_success:
+            output_text, execution_success, fail_reason, post_info = self._postprocess_python_source_edit(
+                params,
+                output_text,
+                execution_success,
+                fail_reason,
+            )
+            extra.update(post_info)
+        observation = f"Exit code: {code_s}\n[output]\n{clip_text(output_text, self.config.max_output_chars, 'editor output')}"
+        info = {
+            "exit_code": code_s,
+            "stdout": clip_text(output_text, self.config.max_output_chars, "stdout"),
+            "stderr": "",
+        }
+        info.update(extra)
+        info["fail_reason"] = fail_reason
+        info["tool_execution_success"] = execution_success
+        info["tool_execution_fail_reason"] = fail_reason
+        return R2EToolResult(
+            observation=observation,
+            is_action_valid=True,
+            info=info,
+        )
+
+    def _try_literal_newline_repair(
+        self,
+        params: Dict[str, Any],
+        output_text: str,
+    ) -> Optional[R2EToolResult]:
         if str(params.get("command") or "") != "str_replace":
             return None
         if params.get("old_str") is None or params.get("new_str") is None:
@@ -831,23 +1072,23 @@ print(json.dumps({{
             return None
 
         retry_text += "\n[editor recovery] Literal backslash-n sequences were converted to real newlines for str_replace."
-        observation = f"Exit code: {retry_code_s}\n[output]\n{clip_text(retry_text, self.config.max_output_chars, 'editor output')}"
-        return R2EToolResult(
-            observation=observation,
-            is_action_valid=True,
-            info={
-                "exit_code": retry_code_s,
-                "stdout": clip_text(retry_text, self.config.max_output_chars, "stdout"),
-                "stderr": "",
-                "fail_reason": None,
-                "tool_execution_success": True,
-                "tool_execution_fail_reason": None,
+        return self._editor_result(
+            repaired_params,
+            retry_text,
+            retry_code_s,
+            True,
+            None,
+            {
                 "literal_newline_repair_applied": True,
                 "editor_recovery_hint": "literal_backslash_newline_repaired",
             },
         )
 
-    def _try_missing_indent_repair(self, params: Dict[str, Any], output_text: str) -> Optional[R2EToolResult]:
+    def _try_missing_indent_repair(
+        self,
+        params: Dict[str, Any],
+        output_text: str,
+    ) -> Optional[R2EToolResult]:
         if str(params.get("command") or "") != "str_replace":
             return None
         if params.get("old_str") is None or params.get("new_str") is None:
@@ -877,24 +1118,27 @@ print(json.dumps({{
             "\n[editor recovery] Adapter repaired missing leading indentation in old_str/new_str "
             f"from the original file at line {repair.get('line_start')} and retried once."
         )
-        observation = f"Exit code: {retry_code_s}\n[output]\n{clip_text(retry_text, self.config.max_output_chars, 'editor output')}"
-        return R2EToolResult(
-            observation=observation,
-            is_action_valid=True,
-            info={
-                "exit_code": retry_code_s,
-                "stdout": clip_text(retry_text, self.config.max_output_chars, "stdout"),
-                "stderr": "",
-                "fail_reason": None,
-                "tool_execution_success": True,
-                "tool_execution_fail_reason": None,
+        repaired_params = dict(params)
+        repaired_params["old_str"] = repair.get("repaired_old_str")
+        repaired_params["new_str"] = repair.get("repaired_new_str")
+        return self._editor_result(
+            repaired_params,
+            retry_text,
+            retry_code_s,
+            True,
+            None,
+            {
                 "indent_repair_applied": True,
                 "indent_repair_line_start": repair.get("line_start"),
                 "editor_recovery_hint": "indent_repaired_old_str",
             },
         )
 
-    def _try_view_range_scoped_repair(self, params: Dict[str, Any], output_text: str) -> Optional[R2EToolResult]:
+    def _try_view_range_scoped_repair(
+        self,
+        params: Dict[str, Any],
+        output_text: str,
+    ) -> Optional[R2EToolResult]:
         if str(params.get("command") or "") != "str_replace":
             return None
         if params.get("old_str") is None or params.get("new_str") is None or params.get("view_range") is None:
@@ -922,17 +1166,16 @@ print(json.dumps({{
             "\n[editor recovery] Adapter expanded view_range into a unique old_str block "
             f"covering lines {repair.get('line_start')}-{repair.get('line_end')} and retried once."
         )
-        observation = f"Exit code: {retry_code_s}\n[output]\n{clip_text(retry_text, self.config.max_output_chars, 'editor output')}"
-        return R2EToolResult(
-            observation=observation,
-            is_action_valid=True,
-            info={
-                "exit_code": retry_code_s,
-                "stdout": clip_text(retry_text, self.config.max_output_chars, "stdout"),
-                "stderr": "",
-                "fail_reason": None,
-                "tool_execution_success": True,
-                "tool_execution_fail_reason": None,
+        repaired_params = dict(params)
+        repaired_params["old_str"] = repair.get("repaired_old_str")
+        repaired_params["new_str"] = repair.get("repaired_new_str")
+        return self._editor_result(
+            repaired_params,
+            retry_text,
+            retry_code_s,
+            True,
+            None,
+            {
                 "range_repair_applied": True,
                 "range_repair_line_start": repair.get("line_start"),
                 "range_repair_line_end": repair.get("line_end"),
@@ -998,24 +1241,19 @@ print(json.dumps({{
             editor_recovery_hint = "path_not_found"
             path_hint, path_recovery_candidates = self._path_recovery_hint(path)
             output_text += "\n" + path_hint
-        observation = f"Exit code: {code_s}\n[output]\n{clip_text(output_text, self.config.max_output_chars, 'editor output')}"
-        info = {
-            "exit_code": code_s,
-            "stdout": clip_text(output_text, self.config.max_output_chars, "stdout"),
-            "stderr": "",
-            "fail_reason": fail_reason,
-            "tool_execution_success": execution_success,
-            "tool_execution_fail_reason": fail_reason,
-        }
+        info: Dict[str, Any] = {}
         if editor_recovery_hint:
             info["editor_recovery_hint"] = editor_recovery_hint
         if path_recovery_applied:
             info["path_recovery_requested_path"] = path
             info["path_recovery_candidates"] = path_recovery_candidates
-        return R2EToolResult(
-            observation=observation,
-            is_action_valid=True,
-            info=info,
+        return self._editor_result(
+            params,
+            output_text,
+            code_s,
+            execution_success,
+            fail_reason,
+            info,
         )
 
     def submit(self) -> R2EToolResult:

@@ -252,7 +252,13 @@ class R2ERewardShapingState:
                 if clean_path not in self.source_files_viewed:
                     self.source_files_viewed.add(clean_path)
                     events.append("unique_source_file_viewed")
-            if is_editor_write(action) and not is_noop_str_replace(action) and execution_success and path_kind == "source":
+            if (
+                is_editor_write(action)
+                and not is_noop_str_replace(action)
+                and execution_success
+                and path_kind == "source"
+                and not result_info.get("semantic_noop_edit")
+            ):
                 self.source_edit_count += 1
                 events.append("successful_source_edit")
 
@@ -262,6 +268,9 @@ class R2ERewardShapingState:
         elif fail_reason == "submit_before_validation_after_source_edit":
             penalty += config.submit_before_validation_after_source_edit_penalty
             events.append("submit_before_validation_after_source_edit")
+        elif fail_reason == "submit_before_passing_validation_after_source_edit":
+            penalty += config.submit_before_validation_after_source_edit_penalty
+            events.append("submit_before_passing_validation_after_source_edit")
         elif fail_reason == "test_edit_blocked":
             penalty += config.edit_test_penalty
             events.append("test_edit_blocked")

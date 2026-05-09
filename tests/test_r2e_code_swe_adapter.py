@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from agent_system.environments.env_manager import attach_r2e_projection_debug
+from agent_system.environments.env_manager import R2ECodeSWEEnvironmentManager, attach_r2e_projection_debug
 from agent_system.environments.env_package.r2e_code_swe.envs import R2ECodeSWEEnv
 from agent_system.environments.env_package.r2e_code_swe.projection import parse_r2e_action
 from agent_system.environments.env_package.r2e_code_swe.prompts import (
@@ -146,7 +146,14 @@ def test_focused_validation_cmd_limits_fail_to_pass_and_small_pass_to_pass():
         "test",
     )
 
-    assert focused_validation_cmd(task) == (
+    context = (
+        "/testbed/tests/test_connector.py:1:collected\n"
+        "/testbed/tests/test_client.py:1:collected\n"
+        "/testbed/tests/test_parser.py:1:collected\n"
+        "/testbed/tests/test_streams.py:1:collected\n"
+    )
+
+    assert focused_validation_cmd(task, validation_context=context) == (
         "python -m pytest -q "
         "tests/test_connector.py::test_limit "
         "tests/test_client.py::test_close "
@@ -155,6 +162,66 @@ def test_focused_validation_cmd_limits_fail_to_pass_and_small_pass_to_pass():
         "tests/test_connector.py::test_regression_a "
         "tests/test_connector.py::test_regression_b"
     )
+
+
+def test_focused_validation_cmd_resolves_orange_nested_test_file_from_context():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "Orange",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix distance behavior.",
+            "FAIL_TO_PASS": ["tests/test_distance.py::test_distances"],
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+    context = (
+        "./Orange/distance/tests/test_distance.py:12:def test_distances():\n"
+        "./Orange/widgets/tests/test_settings.py:8:other test\n"
+    )
+
+    assert focused_validation_cmd(task, validation_context=context) == (
+        "python -m pytest -q Orange/distance/tests/test_distance.py::test_distances"
+    )
+
+
+def test_focused_validation_cmd_uses_find_wrapper_for_unverified_root_tests_path():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "Orange",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix distance behavior.",
+            "FAIL_TO_PASS": ["tests/test_distance.py"],
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+
+    command = focused_validation_cmd(task)
+
+    assert "python -m pytest -q tests/test_distance.py" not in command
+    assert "[ -f 'tests/test_distance.py' ]" in command
+    assert "find . -path '*test_distance.py' -type f | head -1" in command
+    assert 'python -m pytest -q "${target#./}"' in command
+
+
+def test_focused_validation_cmd_drops_unresolved_root_tests_target_when_context_has_no_match():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "Orange",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix distance behavior.",
+            "FAIL_TO_PASS": ["tests/test_distance.py"],
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+    context = "./Orange/widgets/tests/test_settings.py:8:other test\n"
+
+    assert focused_validation_cmd(task, validation_context=context) == "python -m pytest -q"
 
 
 def test_focused_validation_cmd_falls_back_without_test_spec():
@@ -232,7 +299,130 @@ def test_step_prompt_uses_observation_test_file_for_focused_validate_fallback():
     assert "<parameter=cmd>python -m pytest -q r2e_tests/test_1.py</parameter>" in prompt
 
 
-def test_prompts_show_focused_validate_command_from_fail_to_pass():
+class _FakeR2EManagerEnv:
+    def __init__(self, task):
+        self.current_tasks = [task]
+        self.step_calls = 0
+
+    def reset(self, kwargs=None):
+        return ["Workspace ready."], [{"task_id": self.current_tasks[0].task_id}]
+
+    def action_mask(self, idx, final_step=False):
+        return {
+            "allowed_tools": ["bash", "str_replace_editor"],
+            "allow_bash": True,
+            "allow_str_replace_editor": True,
+            "allow_validate": False,
+            "allow_submit": False,
+        }
+
+    def step(self, actions):
+        self.step_calls += 1
+        action = actions[0]
+        path = str((action.get("parameters") or {}).get("path") or "")
+        if "domain_context_handler.py" in path:
+            return (
+                ["ERROR: The path does not exist."],
+                [0.0],
+                [False],
+                [
+                    {
+                        "is_action_valid": True,
+                        "tool_execution_success": False,
+                        "fail_reason": "editor_error",
+                        "path_recovery_requested_path": "/testbed/Orange/widgets/domain_context_handler.py",
+                        "path_recovery_candidates": [
+                            "/testbed/Orange/widgets/settings.py",
+                            "/testbed/Orange/widgets/tests/test_settings.py",
+                        ],
+                    }
+                ],
+            )
+        return (
+            ["Viewed /testbed/Orange/widgets/settings.py"],
+            [0.0],
+            [False],
+            [
+                {
+                    "is_action_valid": True,
+                    "tool_execution_success": True,
+                    "edit_path_kind": "source",
+                    "edit_path": "/testbed/Orange/widgets/settings.py",
+                }
+            ],
+        )
+
+
+def test_r2e_manager_persists_source_candidates_forbidden_paths_and_selected_file_in_prompts():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "Orange",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix ContextHandler behavior.",
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+    fake_env = _FakeR2EManagerEnv(task)
+
+    def projection(text_actions):
+        if "settings" in text_actions[0]:
+            return (
+                [
+                    {
+                        "tool_name": "str_replace_editor",
+                        "parameters": {"command": "view", "path": "/testbed/Orange/widgets/settings.py"},
+                    }
+                ],
+                [1],
+            )
+        return (
+            [
+                {
+                    "tool_name": "str_replace_editor",
+                    "parameters": {
+                        "command": "view",
+                        "path": "/testbed/Orange/widgets/domain_context_handler.py",
+                    },
+                }
+            ],
+            [1],
+        )
+
+    manager = R2ECodeSWEEnvironmentManager(
+        fake_env,
+        projection,
+        SimpleNamespace(
+            env=SimpleNamespace(
+                history_length=1,
+                max_steps=5,
+                r2e_code_swe=SimpleNamespace(prompt=SimpleNamespace(max_observation_chars=4000)),
+            )
+        ),
+    )
+
+    manager.reset(kwargs={})
+    next_observations, _, _, _ = manager.step(["missing path"])
+    prompt = next_observations["text"][0]
+
+    assert manager.r2e_state[0]["source_candidates"] == ["/testbed/Orange/widgets/settings.py"]
+    assert manager.r2e_state[0]["forbidden_paths"] == ["/testbed/Orange/widgets/domain_context_handler.py"]
+    assert "Current source candidates:" in prompt
+    assert "- /testbed/Orange/widgets/settings.py" in prompt
+    assert "Forbidden failed paths:" in prompt
+    assert "- /testbed/Orange/widgets/domain_context_handler.py" in prompt
+    assert "Do not use forbidden paths again." in prompt
+
+    next_observations, _, _, _ = manager.step(["settings"])
+    prompt = next_observations["text"][0]
+
+    assert manager.r2e_state[0]["selected_source_file"] == "/testbed/Orange/widgets/settings.py"
+    assert "Selected source file: /testbed/Orange/widgets/settings.py" in prompt
+    assert "Forbidden failed paths:" in prompt
+
+
+def test_initial_prompt_hides_focused_validate_command_when_validate_is_masked():
     task = normalize_r2e_task_record(
         {
             "repo_name": "aiohttp",
@@ -246,8 +436,25 @@ def test_prompts_show_focused_validate_command_from_fail_to_pass():
     )
 
     initial_prompt = build_initial_prompt(task, current_observation="Workspace ready.")
-    assert "Recommended focused validate command: python -m pytest -q tests/test_http_parser.py::test_chunk_split" in initial_prompt
+    assert "Recommended focused validate command:" not in initial_prompt
+    assert "python -m pytest -q tests/test_http_parser.py::test_chunk_split" not in initial_prompt
+    assert "Validation is currently unavailable because no successful source edit has been made." in initial_prompt
+    assert "Your next action must be bash or str_replace_editor." in initial_prompt
     assert "<function=validate>" not in initial_prompt
+
+
+def test_prompts_show_focused_validate_command_from_fail_to_pass_when_validate_allowed():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+            "FAIL_TO_PASS": ["tests/test_http_parser.py::test_chunk_split"],
+        },
+        "R2E-Gym/SWE-Bench-Lite",
+        "test",
+    )
 
     step_prompt = build_step_prompt(
         task,
@@ -258,9 +465,46 @@ def test_prompts_show_focused_validate_command_from_fail_to_pass():
         max_steps=5,
         tool_mask={"allow_validate": True, "allow_submit": False},
     )
-    assert "Recommended focused validate command: python -m pytest -q tests/test_http_parser.py::test_chunk_split" in step_prompt
-    assert "<parameter=cmd>python -m pytest -q tests/test_http_parser.py::test_chunk_split</parameter>" in step_prompt
+    assert "Recommended focused validate command:" in step_prompt
+    assert "[ -f 'tests/test_http_parser.py' ]" in step_prompt
+    assert "find . -path '*test_http_parser.py' -type f | head -1" in step_prompt
+    assert 'python -m pytest -q "${target#./}"' in step_prompt
+    assert "::test_chunk_split" in step_prompt
+    assert "<parameter=cmd>target=$(if [ -f 'tests/test_http_parser.py' ]" in step_prompt
     assert "<parameter=cmd>python -m pytest -q</parameter>" not in step_prompt
+
+
+def test_step_prompt_hides_focused_validate_command_when_validate_is_masked():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+            "FAIL_TO_PASS": ["tests/test_http_parser.py::test_chunk_split"],
+        },
+        "R2E-Gym/SWE-Bench-Lite",
+        "test",
+    )
+
+    step_prompt = build_step_prompt(
+        task,
+        current_observation="./r2e_tests/test_1.py:3:chunk split failure",
+        history_context="Previous step 1",
+        history_length=1,
+        current_step=2,
+        max_steps=5,
+        tool_mask={"allow_validate": False, "allow_submit": False},
+    )
+
+    assert "Recommended focused validate command:" not in step_prompt
+    assert "python -m pytest -q tests/test_http_parser.py::test_chunk_split" not in step_prompt
+    assert "python -m pytest -q r2e_tests/test_1.py" not in step_prompt
+    assert "Validation is currently unavailable because no successful source edit has been made." in step_prompt
+    assert "Your next action must be bash or str_replace_editor." in step_prompt
+    assert "<function=validate>" not in step_prompt
+    assert "<function=bash>" in step_prompt
+    assert "<function=str_replace_editor>" in step_prompt
 
 
 def test_issue_search_terms_prioritizes_source_symbols_before_quotes_and_words():
@@ -337,7 +581,7 @@ def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():
     assert "<function=validate>" not in prompt
     assert "<function=submit></function>" not in prompt
     assert "Masked tool calls now:" in prompt
-    assert "validate: available after a successful source edit" in prompt
+    assert "validate: unavailable until a successful source edit has been made." in prompt
     assert "submit: available after a successful source edit and validation" in prompt
     assert "- Markdown code fences" in prompt
     assert "- JSON in a Markdown fenced block" in prompt
@@ -1353,6 +1597,92 @@ def test_r2e_runtime_editor_nonunique_error_adds_recovery_hint():
     assert "Do not repeat the same one-line str_replace" in result.observation
 
 
+def test_r2e_runtime_py_compile_failure_marks_python_source_edit_unsuccessful():
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if "str_replace_editor" in command:
+            return "edited", "0"
+        if "py_compile" in command:
+            return '  File "/testbed/pkg/mod.py", line 1\n    broken(\nSyntaxError: was never closed\n', "1"
+        return "", "0"
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=4000))
+    runtime.env = SimpleNamespace(runtime=SimpleNamespace(run=fake_run))
+
+    result = runtime.run_editor(
+        {
+            "command": "str_replace",
+            "path": "/testbed/pkg/mod.py",
+            "old_str": "value = 1",
+            "new_str": "broken(",
+        }
+    )
+
+    assert any("python -m py_compile /testbed/pkg/mod.py" in command for command in commands)
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is False
+    assert result.info["fail_reason"] == "py_compile_failed"
+    assert result.info["tool_execution_fail_reason"] == "py_compile_failed"
+    assert result.info["py_compile_failed"] is True
+    assert "py_compile failed" in result.observation
+
+
+def test_r2e_runtime_warns_when_import_block_edit_removes_multiple_names():
+    def fake_run(command, **kwargs):
+        if "str_replace_editor" in command:
+            return "edited", "0"
+        if "py_compile" in command:
+            return "", "0"
+        return "", "0"
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=4000))
+    runtime.env = SimpleNamespace(runtime=SimpleNamespace(run=fake_run))
+
+    result = runtime.run_editor(
+        {
+            "command": "str_replace",
+            "path": "/testbed/pkg/mod.py",
+            "old_str": "from aiohttp.http_exceptions import TransferEncodingError, PayloadEncodingError, BadStatusLine\n",
+            "new_str": "from aiohttp.http_exceptions import TransferEncodingError\n",
+        }
+    )
+
+    assert result.info["tool_execution_success"] is True
+    assert result.info["import_block_high_risk"] is True
+    assert result.info["removed_import_names"] == ["BadStatusLine", "PayloadEncodingError"]
+    assert "High-risk import edit" in result.observation
+
+
+def test_r2e_runtime_marks_quote_only_python_edit_as_semantic_noop():
+    def fake_run(command, **kwargs):
+        if "R2E_SEMANTIC_SNAPSHOT" in command:
+            return json.dumps({"ok": True, "semantic_noop": True, "reason": "ast_dump_equal"}), "0"
+        if "str_replace_editor" in command:
+            return "edited", "0"
+        if "py_compile" in command:
+            return "", "0"
+        return "", "0"
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=4000))
+    runtime.env = SimpleNamespace(runtime=SimpleNamespace(run=fake_run))
+
+    result = runtime.run_editor(
+        {
+            "command": "str_replace",
+            "path": "/testbed/pkg/mod.py",
+            "old_str": "VALUE = 'same'\n",
+            "new_str": 'VALUE = "same"\n',
+        }
+    )
+
+    assert result.info["tool_execution_success"] is True
+    assert result.info["semantic_noop_edit"] is True
+    assert result.info["semantic_noop_reason"] == "ast_dump_equal"
+    assert "semantic no-op" in result.observation
+
+
 def test_r2e_runtime_editor_repairs_missing_common_indent_before_retry():
     commands = []
 
@@ -1375,6 +1705,10 @@ def test_r2e_runtime_editor_repairs_missing_common_indent_before_retry():
                 ),
                 "0",
             )
+        if "py_compile" in command:
+            return ("", "0")
+        if "R2E_SEMANTIC_SNAPSHOT" in command:
+            return json.dumps({"ok": True, "semantic_noop": False, "reason": None}), "0"
         return ("The file /testbed/aiohttp/http_parser.py has been edited.", "0")
 
     runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=2000))
@@ -1389,11 +1723,15 @@ def test_r2e_runtime_editor_repairs_missing_common_indent_before_retry():
         }
     )
 
-    assert len(commands) == 3
+    assert len(commands) == 5
     assert "python3" in commands[1]
     assert "--old_str '                if pos >= start_pos:" in commands[2]
     assert "raise BadHttpMessage" in commands[2]
+    assert "python -m py_compile /testbed/aiohttp/http_parser.py" in commands[3]
+    assert "R2E_SEMANTIC_SNAPSHOT" in commands[4]
     assert result.info["tool_execution_success"] is True
+    assert result.info["py_compile_success"] is True
+    assert result.info.get("semantic_noop_edit") is not True
     assert result.info["indent_repair_applied"] is True
     assert result.info["editor_recovery_hint"] == "indent_repaired_old_str"
     assert "repaired missing leading indentation" in result.observation
@@ -1409,6 +1747,10 @@ def test_r2e_runtime_editor_repairs_literal_backslash_newlines_before_retry():
                 "ERROR: No occurrences of 'PARSE_CHUNKED_SIZE = 0\\nPARSE_CHUNKED_CHUNK = 1' found in /testbed/aiohttp/http_parser.py for replacement.\n",
                 "0",
             )
+        if "py_compile" in command:
+            return ("", "0")
+        if "R2E_SEMANTIC_SNAPSHOT" in command:
+            return json.dumps({"ok": True, "semantic_noop": False, "reason": None}), "0"
         return ("The file /testbed/aiohttp/http_parser.py has been edited.", "0")
 
     runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=2000))
@@ -1423,10 +1765,14 @@ def test_r2e_runtime_editor_repairs_literal_backslash_newlines_before_retry():
         }
     )
 
-    assert len(commands) == 2
+    assert len(commands) == 4
     assert "--old_str 'PARSE_CHUNKED_SIZE = 0\nPARSE_CHUNKED_CHUNK = 1'" in commands[1]
     assert "PARSE_CHUNKED_TRAILER = 2" in commands[1]
+    assert "python -m py_compile /testbed/aiohttp/http_parser.py" in commands[2]
+    assert "R2E_SEMANTIC_SNAPSHOT" in commands[3]
     assert result.info["tool_execution_success"] is True
+    assert result.info["py_compile_success"] is True
+    assert result.info.get("semantic_noop_edit") is not True
     assert result.info["literal_newline_repair_applied"] is True
     assert result.info["editor_recovery_hint"] == "literal_backslash_newline_repaired"
     assert "Literal backslash-n sequences were converted to real newlines" in result.observation
@@ -1456,6 +1802,10 @@ def test_r2e_runtime_editor_repairs_view_range_scoped_nonunique_replace():
                 ),
                 "0",
             )
+        if "py_compile" in command:
+            return ("", "0")
+        if "R2E_SEMANTIC_SNAPSHOT" in command:
+            return json.dumps({"ok": True, "semantic_noop": False, "reason": None}), "0"
         return ("The file /testbed/Orange/widgets/settings.py has been edited.", "0")
 
     runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=2000))
@@ -1471,11 +1821,15 @@ def test_r2e_runtime_editor_repairs_view_range_scoped_nonunique_replace():
         }
     )
 
-    assert len(commands) == 3
+    assert len(commands) == 5
     assert "python3" in commands[1]
     assert "--old_str '                    raise IncompatibleContext()" in commands[2]
     assert "--new_str '                    pass" in commands[2]
+    assert "python -m py_compile /testbed/Orange/widgets/settings.py" in commands[3]
+    assert "R2E_SEMANTIC_SNAPSHOT" in commands[4]
     assert result.info["tool_execution_success"] is True
+    assert result.info["py_compile_success"] is True
+    assert result.info.get("semantic_noop_edit") is not True
     assert result.info["range_repair_applied"] is True
     assert result.info["range_repair_replacement_count"] == 2
     assert result.info["editor_recovery_hint"] == "view_range_scoped_old_str"
@@ -1703,6 +2057,53 @@ class _FailingValidationPolicyRuntime(_PolicyRuntime):
         )
 
 
+class _PassingValidationPolicyRuntime(_PolicyRuntime):
+    def run_bash(self, cmd, cwd=None):
+        self.bash_count += 1
+        return R2EToolResult(
+            "Exit code: 0\n[output]\nfocused test passed",
+            is_action_valid=True,
+            info={
+                "exit_code": "0",
+                "tool_execution_success": True,
+                "tool_execution_fail_reason": None,
+                "fail_reason": None,
+            },
+        )
+
+
+class _LargeFailingValidationPolicyRuntime(_PolicyRuntime):
+    def run_bash(self, cmd, cwd=None):
+        self.bash_count += 1
+        return R2EToolResult(
+            "Exit code: 1\n[output]\n================= 7 failed, 1 passed in 2.0s =================",
+            is_action_valid=True,
+            info={
+                "exit_code": "1",
+                "stdout": "================= 7 failed, 1 passed in 2.0s =================",
+                "tool_execution_success": False,
+                "tool_execution_fail_reason": "command_failed",
+                "fail_reason": "command_failed",
+            },
+        )
+
+
+class _SemanticNoopEditPolicyRuntime(_PolicyRuntime):
+    def run_editor(self, params):
+        self.editor_count += 1
+        return R2EToolResult(
+            "edited\n[post-edit check] semantic no-op edit detected",
+            is_action_valid=True,
+            info={
+                "tool_execution_success": True,
+                "tool_execution_fail_reason": None,
+                "fail_reason": None,
+                "semantic_noop_edit": True,
+                "semantic_noop_reason": "ast_dump_equal",
+            },
+        )
+
+
 def _make_policy_env(runtime, require_validation_before_submit=False):
     task = _r2e_task_for_env_policy_tests()
     env = R2ECodeSWEEnv(
@@ -1720,6 +2121,7 @@ def _make_policy_env(runtime, require_validation_before_submit=False):
     env.successful_edit_counts = [0]
     env.successful_source_edit_counts = [0]
     env.validation_after_source_edit_counts = [0]
+    env.last_validation_exit_codes = [None]
     env.reward_shaping_states = [env.reward_shaping_config.new_state()]
     env.last_failed_action_signatures = [None]
     env.repeated_failed_action_counts = [0]
@@ -2010,6 +2412,7 @@ def test_r2e_env_source_edit_gets_shaping_and_unlocks_submit():
 def test_r2e_env_blocks_submit_until_validation_after_source_edit():
     runtime = _FailingValidationPolicyRuntime()
     env = _make_policy_env(runtime, require_validation_before_submit=True)
+    env.max_steps = 10
 
     env.step(
         [
@@ -2050,15 +2453,18 @@ def test_r2e_env_blocks_submit_until_validation_after_source_edit():
     assert runtime.bash_count == 1
     assert env.validation_after_source_edit_counts == [1]
     assert infos[0]["validation_after_source_edit_count"] == 1
+    assert infos[0]["last_validation_exit_code"] == "1"
+    assert infos[0]["action_mask"]["allow_submit"] is False
 
     obs, rewards, dones, infos = env.step([{"tool_name": "submit", "parameters": {}}])
 
-    assert runtime.submit_count == 1
-    assert dones == [True]
+    assert runtime.submit_count == 0
+    assert dones == [False]
+    assert infos[0]["fail_reason"] == "submit_before_passing_validation_after_source_edit"
 
 
 def test_r2e_env_validate_tool_is_masked_until_edit_then_unlocks_submit():
-    runtime = _FailingValidationPolicyRuntime()
+    runtime = _PassingValidationPolicyRuntime()
     env = _make_policy_env(runtime, require_validation_before_submit=True)
 
     obs, rewards, dones, infos = env.step([{"tool_name": "validate", "parameters": {"cmd": "python -m pytest -q"}}])
@@ -2104,6 +2510,88 @@ def test_r2e_env_validate_tool_is_masked_until_edit_then_unlocks_submit():
     assert dones == [True]
 
 
+def test_r2e_env_blocks_nonfinal_submit_after_failing_validation_until_validation_passes():
+    runtime = _FailingValidationPolicyRuntime()
+    env = _make_policy_env(runtime, require_validation_before_submit=True)
+
+    env.step(
+        [
+            {
+                "tool_name": "str_replace_editor",
+                "parameters": {
+                    "command": "str_replace",
+                    "path": "/testbed/aiohttp/http_parser.py",
+                    "old_str": "old",
+                    "new_str": "new",
+                },
+            }
+        ]
+    )
+    obs, rewards, dones, infos = env.step([{"tool_name": "validate", "parameters": {"cmd": "python -m pytest -q"}}])
+
+    assert env.validation_after_source_edit_counts == [1]
+    assert infos[0]["last_validation_exit_code"] == "1"
+    assert infos[0]["action_mask"]["allow_submit"] is False
+    assert infos[0]["action_mask"]["submit_reason"] == "requires_passing_validation_after_source_edit"
+
+    obs, rewards, dones, infos = env.step([{"tool_name": "submit", "parameters": {}}])
+
+    assert runtime.submit_count == 0
+    assert dones == [False]
+    assert "validation command is still failing" in obs[0]
+    assert infos[0]["fail_reason"] == "submit_before_passing_validation_after_source_edit"
+
+    passing_runtime = _PassingValidationPolicyRuntime()
+    env.runtimes = [passing_runtime]
+    obs, rewards, dones, infos = env.step([{"tool_name": "validate", "parameters": {"cmd": "python -m pytest -q"}}])
+
+    assert env.validation_after_source_edit_counts == [2]
+    assert infos[0]["last_validation_exit_code"] == "0"
+    assert infos[0]["action_mask"]["allow_submit"] is True
+
+    obs, rewards, dones, infos = env.step([{"tool_name": "submit", "parameters": {}}])
+
+    assert passing_runtime.submit_count == 1
+    assert dones == [True]
+
+
+def test_r2e_env_large_validation_failure_after_edit_does_not_unlock_submit():
+    runtime = _LargeFailingValidationPolicyRuntime()
+    env = _make_policy_env(runtime, require_validation_before_submit=True)
+
+    env.step(
+        [
+            {
+                "tool_name": "str_replace_editor",
+                "parameters": {
+                    "command": "str_replace",
+                    "path": "/testbed/aiohttp/http_parser.py",
+                    "old_str": "old",
+                    "new_str": "new",
+                },
+            }
+        ]
+    )
+
+    obs, rewards, dones, infos = env.step([{"tool_name": "validate", "parameters": {"cmd": "python -m pytest -q r2e_tests/test_1.py"}}])
+
+    assert runtime.bash_count == 1
+    assert env.validation_after_source_edit_counts == [0]
+    assert infos[0]["validation_action"] is True
+    assert infos[0]["large_validation_failure_after_edit"] is True
+    assert infos[0]["validation_failure_count"] == 7
+    assert infos[0]["action_mask"]["allow_submit"] is False
+    assert "Focused validation produced many failures after your edit" in obs[0]
+    assert "undo_edit" in obs[0]
+    assert "Do not submit" in obs[0]
+
+    obs, rewards, dones, infos = env.step([{"tool_name": "submit", "parameters": {}}])
+
+    assert runtime.submit_count == 0
+    assert dones == [False]
+    assert infos[0]["fail_reason"] == "submit_before_validation_after_source_edit"
+
+
 def test_r2e_env_noop_str_replace_does_not_count_as_source_edit_or_unlock_submit():
     runtime = _PolicyRuntime()
     env = _make_policy_env(runtime)
@@ -2134,6 +2622,43 @@ def test_r2e_env_noop_str_replace_does_not_count_as_source_edit_or_unlock_submit
     obs, rewards, dones, infos = env.step([{"tool_name": "submit", "parameters": {}}])
     assert runtime.submit_count == 0
     assert dones == [False]
+    assert infos[0]["fail_reason"] == "submit_before_successful_source_edit"
+
+
+def test_r2e_env_semantic_noop_edit_does_not_count_or_unlock_validate_submit():
+    runtime = _SemanticNoopEditPolicyRuntime()
+    env = _make_policy_env(runtime, require_validation_before_submit=True)
+
+    obs, rewards, dones, infos = env.step(
+        [
+            {
+                "tool_name": "str_replace_editor",
+                "parameters": {
+                    "command": "str_replace",
+                    "path": "/testbed/aiohttp/http_parser.py",
+                    "old_str": "VALUE = 'same'\n",
+                    "new_str": 'VALUE = "same"\n',
+                },
+            }
+        ]
+    )
+
+    assert runtime.editor_count == 1
+    assert dones == [False]
+    assert infos[0]["tool_execution_success"] is True
+    assert infos[0]["semantic_noop_edit"] is True
+    assert infos[0]["successful_source_edit_count"] == 0
+    assert env.successful_source_edit_counts == [0]
+    assert infos[0]["action_mask"]["allow_validate"] is False
+    assert infos[0]["action_mask"]["allow_submit"] is False
+    assert "semantic no-op" in obs[0]
+    assert "successful_source_edit" not in infos[0]["reward_breakdown"]["events"]
+
+    obs, rewards, dones, infos = env.step([{"tool_name": "validate", "parameters": {"cmd": "python -m pytest -q"}}])
+    assert infos[0]["fail_reason"] == "validate_before_successful_source_edit"
+
+    obs, rewards, dones, infos = env.step([{"tool_name": "submit", "parameters": {}}])
+    assert runtime.submit_count == 0
     assert infos[0]["fail_reason"] == "submit_before_successful_source_edit"
 
 
