@@ -1,0 +1,5 @@
+strategy,source_log,completed_steps,expected_total_steps,is_complete,train_success_rate_last,train_success_rate_max,val_success_rate_last,val_success_rate_max,train_episode_length_mean,train_reward_mean,prompt_tokens_mean,response_tokens_mean,epoch_time_mean,valid_action_ratio_mean,train_tail_mean,train_tail_std,val_tail_mean,val_tail_std,peak_to_late_drop,late_len_mean,horizon_cap_ratio,late_prompt_mean,late_step_time_s,late_valid_action_ratio,late_stage_note
+K=3,experiments/logs/lab-server/recent_window_k3.log,0,50,False,,,,,,,,,,,,,,,,,,,,,no_train_metrics;no_val_metrics
+K=5,experiments/logs/lab-server/recent_window_k5.log,0,50,False,,,,,,,,,,,,,,,,,,,,,no_train_metrics;no_val_metrics
+Full History,experiments/logs/lab-server/full_history.log,0,50,False,,,,,,,,,,,,,,,,,,,,,no_train_metrics;no_val_metrics
+Structured Summary,experiments/logs/lab-server/structured_summary.log,0,50,False,,,,,,,,,,,,,,,,,,,,,no_train_metrics;no_val_metrics

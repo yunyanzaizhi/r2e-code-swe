@@ -1,0 +1,546 @@
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from agent_system.environments.env_manager import attach_r2e_projection_debug
+from agent_system.environments.env_package.r2e_code_swe.projection import parse_r2e_action
+from agent_system.environments.env_package.r2e_code_swe.prompts import build_initial_prompt, build_step_prompt
+from agent_system.multi_turn_rollout.rollout_loop import TrajectoryCollector
+from agent_system.environments.env_package.r2e_code_swe.runtime import R2ERepoRuntime, R2ERuntimeConfig
+from agent_system.environments.env_package.r2e_code_swe.tasks import (
+    SplitPolicyError,
+    normalize_r2e_task_record,
+    validate_r2e_split_policy,
+)
+
+
+def test_normalize_r2egym_lite_record_keeps_docker_metadata_and_reward_only_fields():
+    record = {
+        "repo_name": "aiohttp",
+        "docker_image": "namanjain12/aiohttp_final:abc123",
+        "commit_hash": "abc123",
+        "problem_statement": "Fix chunk parser.",
+        "expected_output_json": json.dumps({"test_x": "PASSED"}),
+        "parsed_commit_content": "gold patch content",
+    }
+
+    task = normalize_r2e_task_record(
+        record,
+        dataset_name="R2E-Gym/R2E-Gym-Lite",
+        split="dev_10pr_v1",
+        index=0,
+    )
+
+    assert task.repo_name == "aiohttp"
+    assert task.docker_image == "namanjain12/aiohttp_final:abc123"
+    assert task.base_commit == "abc123"
+    assert task.test_spec["expected_output_json"] == {"test_x": "PASSED"}
+    assert task.gold_patch_optional == "gold patch content"
+    assert task.raw_record["docker_image"] == "namanjain12/aiohttp_final:abc123"
+
+
+def test_prompt_never_leaks_expected_output_or_gold_patch():
+    record = {
+        "repo_name": "aiohttp",
+        "docker_image": "namanjain12/aiohttp_final:abc123",
+        "commit_hash": "abc123",
+        "problem_statement": "Fix chunk parser.",
+        "expected_output_json": json.dumps({"SECRET_TEST": "PASSED"}),
+        "parsed_commit_content": "SECRET_GOLD_PATCH",
+    }
+    task = normalize_r2e_task_record(record, "R2E-Gym/R2E-Gym-Lite", "dev_10pr_v1")
+
+    prompt = build_initial_prompt(task, current_observation="Workspace ready.", max_problem_chars=2000)
+
+    assert "Fix chunk parser." in prompt
+    assert "namanjain12/aiohttp_final:abc123" in prompt
+    assert "SECRET_TEST" not in prompt
+    assert "SECRET_GOLD_PATCH" not in prompt
+
+
+def test_prompt_enforces_single_safe_tool_call_without_placeholders():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+        },
+        "R2E-Gym/R2E-Gym-Lite",
+        "dev_10pr_v1",
+    )
+
+    prompt = build_initial_prompt(task, current_observation="Workspace ready.")
+
+    assert "You must output exactly one tool call." in prompt
+    assert "Do not output explanations." in prompt
+    assert "Do not output markdown." in prompt
+    assert "Do not output multiple tool calls." in prompt
+    assert 'Do not write planning prose such as "To address", "Here is", or "step-by-step".' in prompt
+    assert "If you are unsure what to do, use the safe bash inspection action." in prompt
+    assert "At the first step, use bash to inspect the repository." in prompt
+    assert "pwd && find . -maxdepth 2 -type f | head -100" in prompt
+    for placeholder in ("class Foo", "/testbed/path/to/file.py", "tool_name", "example.py"):
+        assert placeholder not in prompt
+
+
+def test_final_step_prompt_requires_submit():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix chunk parser.",
+        },
+        "R2E-Gym/R2E-Gym-Lite",
+        "dev_10pr_v1",
+    )
+
+    prompt = build_step_prompt(
+        task,
+        current_observation="Last command output.",
+        history_context="Action: bash",
+        history_length=1,
+        current_step=4,
+        max_steps=4,
+    )
+
+    assert "This is the final allowed step." in prompt
+    assert "Your entire response must be exactly:" in prompt
+    assert "<function=submit>" in prompt
+
+
+def test_dev_split_is_rejected_for_training_without_explicit_override():
+    with pytest.raises(SplitPolicyError):
+        validate_r2e_split_policy(
+            dataset_name="R2E-Gym/R2E-Gym-Lite",
+            split="dev_10pr_v1",
+            mode="train",
+            allow_train_on_dev=False,
+        )
+
+    validate_r2e_split_policy(
+        dataset_name="R2E-Gym/R2E-Gym-Lite",
+        split="dev_10pr_v1",
+        mode="train",
+        allow_train_on_dev=True,
+    )
+
+
+def test_swe_bench_lite_test_is_rejected_for_training():
+    with pytest.raises(SplitPolicyError):
+        validate_r2e_split_policy(
+            dataset_name="R2E-Gym/SWE-Bench-Lite",
+            split="test",
+            mode="train",
+            allow_train_on_dev=True,
+        )
+
+
+def test_parse_r2e_actions_supports_xml_and_json_and_reports_invalid_actions():
+    bash = parse_r2e_action(
+        "<function=bash>\n<parameter=cmd>pwd</parameter>\n</function>"
+    )
+    assert bash.is_valid
+    assert bash.action == {"tool_name": "bash", "parameters": {"cmd": "pwd"}}
+
+    bash_body = parse_r2e_action("<function=bash>\npwd && ls\n</function>")
+    assert bash_body.is_valid
+    assert bash_body.action == {"tool_name": "bash", "parameters": {"cmd": "pwd && ls"}}
+
+    submit = parse_r2e_action('{"tool_name": "submit", "parameters": {}}')
+    assert submit.is_valid
+    assert submit.action == {"tool_name": "submit", "parameters": {}}
+
+    invalid = parse_r2e_action("<function=bash></function>")
+    assert not invalid.is_valid
+    assert invalid.action["tool_name"] == ""
+    assert "requires" in invalid.error
+
+
+def test_parse_r2e_action_rejects_multiple_tool_calls_without_placeholder_error():
+    invalid = parse_r2e_action(
+        "<function=bash>\n"
+        "<parameter=cmd>pwd</parameter>\n"
+        "</function>\n"
+        "<function=submit>\n"
+        "</function>"
+    )
+
+    assert not invalid.is_valid
+    assert "exactly one" in invalid.error
+    assert "tool_name" not in invalid.error
+
+
+def test_parse_r2e_action_accepts_markdown_fenced_json_and_bash():
+    fenced_json = parse_r2e_action(
+        "```json\n"
+        '{"tool_name": "bash", "parameters": {"cmd": "grep -r TODO ."}}\n'
+        "```"
+    )
+    assert fenced_json.is_valid
+    assert fenced_json.action == {"tool_name": "bash", "parameters": {"cmd": "grep -r TODO ."}}
+
+    fenced_bash = parse_r2e_action(
+        "```bash\n"
+        "str_replace_editor view /testbed/tests/test_resolver.py\n"
+        "```"
+    )
+    assert fenced_bash.is_valid
+    assert fenced_bash.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/tests/test_resolver.py"},
+    }
+
+
+
+def test_parse_r2e_action_accepts_json_tool_schema_variants():
+    flat_tool = parse_r2e_action(
+        "```json\n"
+        '{"tool": "str_replace_editor", "command": "view", "path": "/testbed/Orange/tree.py"}\n'
+        "```"
+    )
+    assert flat_tool.is_valid
+    assert flat_tool.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/Orange/tree.py"},
+    }
+
+    wrapped_tool_call = parse_r2e_action(
+        "```json\n"
+        '{"tool_call": {"tool_name": "str_replace_editor", "parameters": {"command": "str_replace", "path": "/testbed/tests/test_resolver.py", "old_str": "old", "new_str": "new"}}}\n'
+        "```"
+    )
+    assert wrapped_tool_call.is_valid
+    assert wrapped_tool_call.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {
+            "command": "str_replace",
+            "path": "/testbed/tests/test_resolver.py",
+            "old_str": "old",
+            "new_str": "new",
+        },
+    }
+
+
+def test_parse_r2e_action_accepts_r2e_style_extracted_json_variants():
+    action_alias = parse_r2e_action(
+        "```json\n"
+        '{"action": "str_replace_editor", "command": "view", "path": "/testbed/tests/test_asyncresolver.py"}\n'
+        "```"
+    )
+    assert action_alias.is_valid
+    assert action_alias.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/tests/test_asyncresolver.py"},
+    }
+
+    prose_wrapped_json = parse_r2e_action(
+        "I will inspect the failing test.\n\n"
+        "```json\n"
+        '{"action": "str_replace_editor", "command": "view", "path": "/testbed/tests/test_http_parser.py"}\n'
+        "```"
+    )
+    assert prose_wrapped_json.is_valid
+    assert prose_wrapped_json.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/tests/test_http_parser.py"},
+    }
+
+    single_openai_tool_call = parse_r2e_action(
+        "```json\n"
+        '{"tool_calls": [{"function": {"name": "bash", "arguments": "{\\\"cmd\\\": \\\"pwd\\\"}"}}]}\n'
+        "```"
+    )
+    assert single_openai_tool_call.is_valid
+    assert single_openai_tool_call.action == {"tool_name": "bash", "parameters": {"cmd": "pwd"}}
+
+
+def test_parse_r2e_action_normalizes_editor_paths_and_search_ranges():
+    line_suffix = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter=command>view</parameter>\n"
+        "<parameter=path>/testbed/tests/test_http_parser.py:272</parameter>\n"
+        "</function>"
+    )
+    assert line_suffix.is_valid
+    assert line_suffix.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/tests/test_http_parser.py", "view_range": [272, -1]},
+    }
+
+    repo_relative = parse_r2e_action(
+        '{"action": "str_replace_editor", "command": "view", "path": "tests/test_http_parser.py:227-240"}'
+    )
+    assert repo_relative.is_valid
+    assert repo_relative.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/tests/test_http_parser.py", "view_range": [227, 240]},
+    }
+
+    symbolic_view_range = parse_r2e_action(
+        '{"action": "str_replace_editor", "command": "view", "path": "/repo/Orange/data.py", "view_range": "DiscreteVariable"}'
+    )
+    assert symbolic_view_range.is_valid
+    assert symbolic_view_range.action == {
+        "tool_name": "bash",
+        "parameters": {"cmd": "grep -RIn -- 'DiscreteVariable' /testbed/Orange/data.py | head -50"},
+    }
+
+def test_parse_r2e_action_accepts_malformed_parameter_tags():
+    malformed_equals = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter=command>str_replace</parameter>\n"
+        "<parameter=path>/testbed/Orange/data/pandas_compat.py</parameter>\n"
+        '<parameter>old_str="table_to_frame"</parameter>\n'
+        '<parameter>new_str="table_from_frame"</parameter>\n'
+        "</function>"
+    )
+    assert malformed_equals.is_valid
+    assert malformed_equals.action["parameters"]["old_str"] == "table_to_frame"
+    assert malformed_equals.action["parameters"]["new_str"] == "table_from_frame"
+
+    malformed_arrow = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter>command>view</parameter>\n"
+        "<parameter>path>/testbed/Orange/tree.py</parameter>\n"
+        "</function>"
+    )
+    assert malformed_arrow.is_valid
+    assert malformed_arrow.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/Orange/tree.py"},
+    }
+
+
+def test_parse_r2e_action_accepts_key_value_parameter_tags():
+    malformed_tag_value = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter=command=view</parameter>\n"
+        "<parameter=path=/testbed/Orange/util.py</parameter>\n"
+        "</function>"
+    )
+    assert malformed_tag_value.is_valid
+    assert malformed_tag_value.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/Orange/util.py"},
+    }
+
+    malformed_body_value = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter>command=create</parameter>\n"
+        "<parameter>path=/testbed/Orange/util.py</parameter>\n"
+        '<parameter>file_text="print(1)"</parameter>\n'
+        "</function>"
+    )
+    assert malformed_body_value.is_valid
+    assert malformed_body_value.action["parameters"]["command"] == "create"
+    assert malformed_body_value.action["parameters"]["path"] == "/testbed/Orange/util.py"
+    assert malformed_body_value.action["parameters"]["file_text"] == "print(1)"
+
+
+def test_parse_r2e_action_converts_editor_cli_shorthand_from_bash():
+    shorthand_view = parse_r2e_action(
+        "<function=bash>\n"
+        "<parameter=cmd>str_replace_editor view /testbed/Orange/data.py</parameter>\n"
+        "</function>"
+    )
+    assert shorthand_view.is_valid
+    assert shorthand_view.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {"command": "view", "path": "/testbed/Orange/data.py"},
+    }
+
+    shorthand_replace = parse_r2e_action(
+        "```bash\n"
+        "str_replace_editor replace /testbed/Orange/data.py old_value new_value\n"
+        "```"
+    )
+    assert shorthand_replace.is_valid
+    assert shorthand_replace.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {
+            "command": "str_replace",
+            "path": "/testbed/Orange/data.py",
+            "old_str": "old_value",
+            "new_str": "new_value",
+        },
+    }
+
+
+
+def test_parse_r2e_action_accepts_xml_parameter_schema_variants():
+    direct_tags = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<command>str_replace</command>\n"
+        "<path>/testbed/Orange/util.py</path>\n"
+        "<old_str>old</old_str>\n"
+        "<new_str>new</new_str>\n"
+        "</function>"
+    )
+    assert direct_tags.is_valid
+    assert direct_tags.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {
+            "command": "str_replace",
+            "path": "/testbed/Orange/util.py",
+            "old_str": "old",
+            "new_str": "new",
+        },
+    }
+
+    parameters_container = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameters>\n"
+        "  <command>view</command>\n"
+        "  <path>/testbed/Orange/data.py</path>\n"
+        "  <view_range>DiscreteVariable</view_range>\n"
+        "</parameters>\n"
+        "</function>"
+    )
+    assert parameters_container.is_valid
+    assert parameters_container.action == {
+        "tool_name": "bash",
+        "parameters": {"cmd": "grep -RIn -- 'DiscreteVariable' /testbed/Orange/data.py | head -50"},
+    }
+
+    comma_kv_body = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter>command=insert, path=/testbed/Orange/base.py, insert_line=25, "
+        "new_str=from Orange.data import ContinuousVariable, DiscreteVariable</parameter>\n"
+        "</function>"
+    )
+    assert comma_kv_body.is_valid
+    assert comma_kv_body.action == {
+        "tool_name": "str_replace_editor",
+        "parameters": {
+            "command": "insert",
+            "path": "/testbed/Orange/base.py",
+            "insert_line": "25",
+            "new_str": "from Orange.data import ContinuousVariable, DiscreteVariable",
+        },
+    }
+
+    sequential_key_value_parameters = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter>command</parameter>\n"
+        "<parameter>create</parameter>\n"
+        "<parameter>path=/testbed/Orange/util.py</parameter>\n"
+        "<parameter>file_text=print(1)</parameter>\n"
+        "</function>"
+    )
+    assert sequential_key_value_parameters.is_valid
+    assert sequential_key_value_parameters.action["parameters"]["command"] == "create"
+    assert sequential_key_value_parameters.action["parameters"]["path"] == "/testbed/Orange/util.py"
+    assert sequential_key_value_parameters.action["parameters"]["file_text"] == "print(1)"
+
+def test_projection_debug_preserves_raw_invalid_response_without_mutating_actions():
+    actions = [{"tool_name": "", "parameters": {}, "error": "Action format error"}]
+
+    enriched = attach_r2e_projection_debug(
+        actions,
+        ["I should inspect the files first."],
+        [0],
+        max_raw_chars=100,
+    )
+
+    assert actions[0].get("_raw_model_response") is None
+    assert enriched[0]["_projection_is_valid"] is False
+    assert enriched[0]["_raw_model_response"] == "I should inspect the files first."
+
+
+def test_rollout_io_logger_writes_train_step_episode_step_json(tmp_path):
+    config = SimpleNamespace(
+        env=SimpleNamespace(
+            env_name="r2e_code_swe",
+            r2e_code_swe=SimpleNamespace(
+                rollout_io=SimpleNamespace(
+                    enabled=True,
+                    log_dir=str(tmp_path),
+                    version="v_test",
+                    max_prompt_chars=80,
+                    max_response_chars=80,
+                    max_observation_chars=80,
+                    max_info_chars=200,
+                )
+            ),
+        )
+    )
+    collector = TrajectoryCollector(config=config, tokenizer=None)
+
+    collector._write_rollout_io_logs(
+        global_step=7,
+        rollout_step=0,
+        obs={"text": ["PROMPT without hidden answers"], "anchor": ["Workspace ready."]},
+        next_obs={"anchor": ["tool output"], "text": ["next prompt"]},
+        text_actions=["<function=bash>\n<parameter=cmd>pwd</parameter>\n</function>"],
+        infos=[
+            {
+                "task_id": "R2E-Gym/R2E-Gym-Subset:train:0:repo:sha",
+                "dataset_name": "R2E-Gym/R2E-Gym-Subset",
+                "split": "train",
+                "parsed_action": {"tool_name": "bash", "parameters": {"cmd": "pwd"}},
+                "expected_output_json": "SECRET_EXPECTED_OUTPUT",
+                "gold_patch_optional": "SECRET_GOLD_PATCH",
+            }
+        ],
+        rewards=[0.0],
+        dones=[False],
+        traj_uid=["abc123"],
+        active_masks=[True],
+    )
+
+    log_path = tmp_path / "v_test" / "train_step_000007" / "episode_0000_abc123" / "step_0001.json"
+    assert log_path.exists()
+    payload = json.loads(log_path.read_text())
+    assert payload["train_step"] == 7
+    assert payload["episode_index"] == 0
+    assert payload["step_index"] == 1
+    assert payload["model_input"] == "PROMPT without hidden answers"
+    assert payload["raw_model_output"].startswith("<function=bash>")
+    assert payload["parsed_action"] == {"tool_name": "bash", "parameters": {"cmd": "pwd"}}
+    assert payload["tool_observation"] == "tool output"
+    assert payload["reward"] == 0.0
+    assert payload["done"] is False
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "SECRET_EXPECTED_OUTPUT" not in serialized
+    assert "SECRET_GOLD_PATCH" not in serialized
+
+
+
+def test_r2e_runtime_separates_protocol_validity_from_bash_execution_failure():
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1))
+    runtime.env = SimpleNamespace(
+        runtime=SimpleNamespace(run=lambda *args, **kwargs: ("", "1"))
+    )
+
+    result = runtime.run_bash('grep -n "missing" /testbed/file.py')
+
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is False
+    assert result.info["tool_execution_fail_reason"] == "command_failed"
+    assert result.info["fail_reason"] == "command_failed"
+
+
+def test_r2e_runtime_separates_protocol_validity_from_editor_execution_failure():
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1))
+    runtime.env = SimpleNamespace(
+        runtime=SimpleNamespace(
+            run=lambda *args, **kwargs: (
+                "ERROR: The path '/testbed/missing.py' does not exist.\n",
+                "0",
+            )
+        )
+    )
+
+    result = runtime.run_editor({"command": "view", "path": "/testbed/missing.py"})
+
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is False
+    assert result.info["tool_execution_fail_reason"] == "editor_error"
+    assert result.info["fail_reason"] == "editor_error"
+
+    unsafe_path = runtime.run_editor({"command": "view", "path": "/tmp/missing.py"})
+    assert unsafe_path.is_action_valid is False
+    assert unsafe_path.info["tool_execution_fail_reason"] == "invalid_path"

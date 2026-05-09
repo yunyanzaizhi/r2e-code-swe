@@ -1,0 +1,46 @@
+{
+  "K=3": {
+    "epochs": [],
+    "train_success_rate": [],
+    "val_success_rate": [],
+    "train_episode_length": [],
+    "train_reward": [],
+    "epoch_time": [],
+    "prompt_tokens": [],
+    "response_tokens": [],
+    "valid_action_ratio": []
+  },
+  "K=5": {
+    "epochs": [],
+    "train_success_rate": [],
+    "val_success_rate": [],
+    "train_episode_length": [],
+    "train_reward": [],
+    "epoch_time": [],
+    "prompt_tokens": [],
+    "response_tokens": [],
+    "valid_action_ratio": []
+  },
+  "Full History": {
+    "epochs": [],
+    "train_success_rate": [],
+    "val_success_rate": [],
+    "train_episode_length": [],
+    "train_reward": [],
+    "epoch_time": [],
+    "prompt_tokens": [],
+    "response_tokens": [],
+    "valid_action_ratio": []
+  },
+  "Structured Summary": {
+    "epochs": [],
+    "train_success_rate": [],
+    "val_success_rate": [],
+    "train_episode_length": [],
+    "train_reward": [],
+    "epoch_time": [],
+    "prompt_tokens": [],
+    "response_tokens": [],
+    "valid_action_ratio": []
+  }
+}
