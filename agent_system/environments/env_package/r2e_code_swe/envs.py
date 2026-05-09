@@ -23,6 +23,21 @@ from .reward_shaping import (
 from .tasks import R2ECodeSWETask, load_r2e_tasks_from_config
 
 
+def _config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 class R2ECodeSWEEnv(gym.Env):
     def __init__(
         self,
@@ -38,6 +53,8 @@ class R2ECodeSWEEnv(gym.Env):
         max_repeated_failed_actions: int = 1,
         max_repeated_failed_action_blocks: int = 3,
         max_repeated_no_progress_actions: int = 3,
+        end_on_repeated_no_progress_limit: bool = True,
+        end_on_repeated_failed_action_limit: bool = True,
         reward_shaping_config: Optional[R2ERewardShapingConfig] = None,
         is_train: bool = True,
     ):
@@ -56,6 +73,8 @@ class R2ECodeSWEEnv(gym.Env):
         self.max_repeated_failed_actions = max_repeated_failed_actions
         self.max_repeated_failed_action_blocks = max_repeated_failed_action_blocks
         self.max_repeated_no_progress_actions = max_repeated_no_progress_actions
+        self.end_on_repeated_no_progress_limit = end_on_repeated_no_progress_limit
+        self.end_on_repeated_failed_action_limit = end_on_repeated_failed_action_limit
         self.reward_shaping_config = reward_shaping_config or R2ERewardShapingConfig()
         self.is_train = is_train
         self._cursor = 0
@@ -359,6 +378,11 @@ class R2ECodeSWEEnv(gym.Env):
         reached_limit = limit >= 0 and count >= limit
         params = action.get("parameters") or {}
         tool_name = str(action.get("tool_name") or "")
+        switch_strategy = (
+            "You must switch strategy on the next step: use a different exact path/range, "
+            "search a different source symbol, inspect a new file, run a focused validation command, "
+            "or make a real source edit. Do not repeat this action again."
+        )
         if tool_name == "bash":
             target = str(params.get("cmd") or "the same bash command")
             repeated_message = (
@@ -374,27 +398,38 @@ class R2ECodeSWEEnv(gym.Env):
                 "run a targeted test, or make a real str_replace before viewing it again."
             )
         if reached_limit:
-            message = (
-                "Repeated no-progress limit reached: the same tool call was requested too many times "
-                "without a source edit. Ending this episode so training receives a clear stuck-trajectory signal."
-            )
+            hard_stop = self.end_on_repeated_no_progress_limit
+            if hard_stop:
+                message = (
+                    "Repeated no-progress limit reached: the same tool call was requested too many times "
+                    "without a source edit. Ending this episode so training receives a clear stuck-trajectory signal."
+                )
+            else:
+                message = (
+                    "Repeated no-progress limit reached: the same tool call was requested too many times "
+                    "without a source edit. Debug soft-stop mode is active, so this episode will continue. "
+                    f"{switch_strategy}"
+                )
             fail_reason = "repeated_no_progress_action_limit"
         else:
+            hard_stop = False
             message = repeated_message
             fail_reason = "repeated_no_progress_action"
         return R2EToolResult(
             message,
-            done=reached_limit,
+            done=hard_stop,
             is_action_valid=True,
             info={
                 "fail_reason": fail_reason,
                 "stderr": message,
                 "edit_path": target,
                 "no_progress_tool_name": tool_name,
-                "exit_reason": fail_reason if reached_limit else None,
+                "exit_reason": fail_reason if hard_stop else None,
                 "repeated_no_progress_action": True,
+                "repeated_no_progress_action_limit": reached_limit,
                 "repeated_no_progress_action_count": count,
                 "max_repeated_no_progress_actions": limit,
+                "end_on_repeated_no_progress_limit": self.end_on_repeated_no_progress_limit,
                 "tool_execution_success": False,
                 "tool_execution_fail_reason": fail_reason,
             },
@@ -415,13 +450,27 @@ class R2ECodeSWEEnv(gym.Env):
         block_count = max(1, self.repeated_failed_action_counts[idx] - self.max_repeated_failed_actions + 1)
         limit = self.max_repeated_failed_action_blocks
         reached_limit = limit >= 0 and block_count >= limit
+        switch_strategy = (
+            "You must switch strategy on the next step: use a different grep pattern/path, "
+            "run pwd && find . -maxdepth 4 -type f | head -160, inspect a real candidate file, "
+            "or make a source edit based on viewed lines. Do not repeat this failed action again."
+        )
         if reached_limit:
-            message = (
-                "Repeated failed-action limit reached: the same failed tool call was blocked too many times. "
-                "Ending this episode so training receives a clear stuck-trajectory signal."
-            )
+            hard_stop = self.end_on_repeated_failed_action_limit
+            if hard_stop:
+                message = (
+                    "Repeated failed-action limit reached: the same failed tool call was blocked too many times. "
+                    "Ending this episode so training receives a clear stuck-trajectory signal."
+                )
+            else:
+                message = (
+                    "Repeated failed-action limit reached: the same failed tool call was blocked too many times. "
+                    "Debug soft-stop mode is active, so this episode will continue. "
+                    f"{switch_strategy}"
+                )
             fail_reason = "repeated_failed_action_limit"
         else:
+            hard_stop = False
             message = (
                 "Repeated failed tool call blocked. Do not repeat the same failed action. "
                 "If grep failed, include both a pattern and an actual path from the workspace preview, "
@@ -432,14 +481,16 @@ class R2ECodeSWEEnv(gym.Env):
             fail_reason = "repeated_failed_action"
         return R2EToolResult(
             message,
-            done=reached_limit,
+            done=hard_stop,
             is_action_valid=True,
             info={
                 "fail_reason": fail_reason,
                 "stderr": message,
-                "exit_reason": fail_reason if reached_limit else None,
+                "exit_reason": fail_reason if hard_stop else None,
+                "repeated_failed_action_limit": reached_limit,
                 "repeated_failed_action_block_count": block_count,
                 "max_repeated_failed_action_blocks": limit,
+                "end_on_repeated_failed_action_limit": self.end_on_repeated_failed_action_limit,
                 "tool_execution_success": False,
                 "tool_execution_fail_reason": fail_reason,
             },
@@ -758,6 +809,14 @@ def build_r2e_code_swe_envs(
         max_repeated_failed_actions=int(getattr(r2e_config, "max_repeated_failed_actions", 1)),
         max_repeated_failed_action_blocks=int(getattr(r2e_config, "max_repeated_failed_action_blocks", 3)),
         max_repeated_no_progress_actions=int(getattr(r2e_config, "max_repeated_no_progress_actions", 3)),
+        end_on_repeated_no_progress_limit=_config_bool(
+            getattr(r2e_config, "end_on_repeated_no_progress_limit", True),
+            default=True,
+        ),
+        end_on_repeated_failed_action_limit=_config_bool(
+            getattr(r2e_config, "end_on_repeated_failed_action_limit", True),
+            default=True,
+        ),
         reward_shaping_config=R2ERewardShapingConfig.from_obj(getattr(r2e_config, "reward_shaping", None)),
         is_train=is_train,
     )

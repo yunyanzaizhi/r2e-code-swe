@@ -41,6 +41,9 @@ def _normalize_tool_mask(tool_mask: Optional[Dict[str, Any]], *, initial: bool =
 _ISSUE_QUOTED_RE = re.compile(r"`([^`\n]{3,120})`|'([^'\n]{3,120})'|\"([^\"\n]{3,120})\"")
 _ISSUE_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b")
 _ISSUE_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b")
+_VALIDATION_TEST_FILE_RE = re.compile(
+    r"(?:(?:/testbed/)|(?:\./))?((?:r2e_tests|tests)/(?:[A-Za-z0-9_.-]+/)*test_[A-Za-z0-9_.-]+\.py)"
+)
 _ISSUE_STOPWORDS = {
     "about",
     "after",
@@ -183,11 +186,27 @@ def _unique_strings(values: List[str]) -> List[str]:
     return unique
 
 
+def _validation_test_files_from_context(text: str) -> Dict[str, List[str]]:
+    grouped = {"r2e_tests": [], "tests": []}
+    seen = set()
+    for match in _VALIDATION_TEST_FILE_RE.finditer(sanitize_prompt_text(text)):
+        path = match.group(1).lstrip("./")
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.startswith("r2e_tests/"):
+            grouped["r2e_tests"].append(path)
+        elif path.startswith("tests/"):
+            grouped["tests"].append(path)
+    return grouped
+
+
 def focused_validation_cmd(
     task: Optional[R2ECodeSWETask],
     max_fail_to_pass: int = 4,
     max_pass_to_pass: int = 2,
     max_run_tests: int = 2,
+    validation_context: str = "",
 ) -> str:
     test_spec = getattr(task, "test_spec", None) or {}
     run_tests = _as_string_list(test_spec.get("run_tests"))[:max_run_tests]
@@ -200,6 +219,12 @@ def focused_validation_cmd(
     )
     if selected_tests:
         return "python -m pytest -q " + " ".join(shlex.quote(test) for test in selected_tests)
+
+    context_tests = _validation_test_files_from_context(validation_context)
+    if context_tests["r2e_tests"]:
+        return "python -m pytest -q " + shlex.quote(context_tests["r2e_tests"][0])
+    if context_tests["tests"]:
+        return "python -m pytest -q " + shlex.quote(context_tests["tests"][0])
     return "python -m pytest -q"
 
 
@@ -207,6 +232,7 @@ def format_r2e_tool_mask(
     tool_mask: Optional[Dict[str, Any]],
     *,
     task: Optional[R2ECodeSWETask] = None,
+    validation_context: str = "",
     initial: bool = False,
     final_step: bool = False,
 ) -> str:
@@ -243,7 +269,7 @@ def format_r2e_tool_mask(
     if mask["allow_validate"]:
         allowed.append(
             "<function=validate>\n"
-            f"<parameter=cmd>{focused_validation_cmd(task)}</parameter>\n"
+            f"<parameter=cmd>{focused_validation_cmd(task, validation_context=validation_context)}</parameter>\n"
             "</function>"
         )
     else:
@@ -424,9 +450,9 @@ Hard constraints:
 
 {R2E_WORKFLOW_HINTS}
 
-Recommended focused validate command: {focused_validation_cmd(task)}
+Recommended focused validate command: {focused_validation_cmd(task, validation_context=current_observation)}
 
-{format_r2e_tool_mask(tool_mask, task=task, initial=True)}
+{format_r2e_tool_mask(tool_mask, task=task, validation_context=current_observation, initial=True)}
 
 {R2E_TOOL_SPEC}
 
@@ -459,6 +485,7 @@ def build_step_prompt(
             "Your entire response must be exactly:\n"
             "<function=submit></function>\n\n"
         )
+    validation_context = "\n".join([history_context or "", current_observation or ""])
     return f"""{R2E_ACTION_PROTOCOL}
 {final_step_instruction}\
 You are a repository-level software engineering agent running inside an R2E-Gym Docker environment.
@@ -481,9 +508,9 @@ Hard constraints:
 
 {R2E_WORKFLOW_HINTS}
 
-Recommended focused validate command: {focused_validation_cmd(task)}
+Recommended focused validate command: {focused_validation_cmd(task, validation_context=validation_context)}
 
-{format_r2e_tool_mask(tool_mask, task=task, final_step=(max_steps is not None and current_step >= max_steps))}
+{format_r2e_tool_mask(tool_mask, task=task, validation_context=validation_context, final_step=(max_steps is not None and current_step >= max_steps))}
 
 {R2E_TOOL_SPEC}
 

@@ -1,8 +1,10 @@
 import json
 import shlex
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from agent_system.environments.env_manager import attach_r2e_projection_debug
@@ -32,6 +34,7 @@ from agent_system.environments.env_package.r2e_code_swe.tasks import (
     normalize_r2e_task_record,
     validate_r2e_split_policy,
 )
+from verl.trainer.ppo.ray_trainer import _valid_action_ratio_from_non_tensor_batch
 
 
 def test_normalize_r2egym_lite_record_keeps_docker_metadata_and_reward_only_fields():
@@ -167,6 +170,66 @@ def test_focused_validation_cmd_falls_back_without_test_spec():
     )
 
     assert focused_validation_cmd(task) == "python -m pytest -q"
+
+
+def test_focused_validation_cmd_falls_back_to_r2e_tests_from_context():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "Orange",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix ContextHandler behavior.",
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+    context = (
+        "./r2e_tests/test_1.py:12:from Orange.widgets.settings import ContextHandler\n"
+        "./tests/test_widgets.py:9:also relevant\n"
+    )
+
+    assert focused_validation_cmd(task, validation_context=context) == "python -m pytest -q r2e_tests/test_1.py"
+
+
+def test_focused_validation_cmd_falls_back_to_tests_file_from_context_without_r2e_tests():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "aiohttp",
+            "docker_image": "namanjain12/aiohttp_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix BaseConnector behavior.",
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+    context = "/testbed/tests/test_connector.py:42:BaseConnector\n"
+
+    assert focused_validation_cmd(task, validation_context=context) == "python -m pytest -q tests/test_connector.py"
+
+
+def test_step_prompt_uses_observation_test_file_for_focused_validate_fallback():
+    task = normalize_r2e_task_record(
+        {
+            "repo_name": "Orange",
+            "docker_image": "namanjain12/orange3_final:abc123",
+            "commit_hash": "abc123",
+            "problem_statement": "Fix ContextHandler behavior.",
+        },
+        "R2E-Gym/R2E-Gym-Subset",
+        "train",
+    )
+
+    prompt = build_step_prompt(
+        task,
+        current_observation="./r2e_tests/test_1.py:3:ContextHandler fails here",
+        history_context="",
+        history_length=0,
+        current_step=3,
+        tool_mask={"allow_validate": True, "allow_submit": False},
+    )
+
+    assert "Recommended focused validate command: python -m pytest -q r2e_tests/test_1.py" in prompt
+    assert "<parameter=cmd>python -m pytest -q r2e_tests/test_1.py</parameter>" in prompt
 
 
 def test_prompts_show_focused_validate_command_from_fail_to_pass():
@@ -532,6 +595,18 @@ def test_parse_r2e_actions_supports_xml_and_json_and_reports_invalid_actions():
     assert submit.is_valid
     assert submit.action == {"tool_name": "submit", "parameters": {}}
 
+    self_closing_submit = parse_r2e_action("<function=submit/>")
+    assert self_closing_submit.is_valid
+    assert self_closing_submit.action == {"tool_name": "submit", "parameters": {}}
+
+    spaced_self_closing_submit = parse_r2e_action("<function=submit />")
+    assert spaced_self_closing_submit.is_valid
+    assert spaced_self_closing_submit.action == {"tool_name": "submit", "parameters": {}}
+
+    empty_body_submit = parse_r2e_action("<function=submit></function>")
+    assert empty_body_submit.is_valid
+    assert empty_body_submit.action == {"tool_name": "submit", "parameters": {}}
+
     validate = parse_r2e_action(
         "<function=validate>\n<parameter=cmd>python -m pytest -q</parameter>\n</function>"
     )
@@ -549,13 +624,21 @@ def test_parse_r2e_action_rejects_multiple_tool_calls_without_placeholder_error(
         "<function=bash>\n"
         "<parameter=cmd>pwd</parameter>\n"
         "</function>\n"
-        "<function=submit>\n"
-        "</function>"
+        "<function=submit/>"
     )
 
     assert not invalid.is_valid
     assert "exactly one" in invalid.error
     assert "tool_name" not in invalid.error
+
+
+def test_valid_action_ratio_ignores_inactive_padding_steps():
+    non_tensor_batch = {
+        "is_action_valid": np.array([True, False, False], dtype=bool),
+        "active_masks": np.array([True, True, False], dtype=bool),
+    }
+
+    assert _valid_action_ratio_from_non_tensor_batch(non_tensor_batch) == pytest.approx(0.5)
 
 
 def test_parse_r2e_action_explains_malformed_str_replace_parameter_tags():
@@ -683,6 +766,45 @@ def test_parse_r2e_action_repairs_common_bash_search_mistakes():
         "parameters": {"cmd": 'grep -n "TransferEncodingError" /testbed/aiohttp/http_parser.py'},
     }
 
+    naked_grep_head_with_repo_root = parse_r2e_action(
+        "<function=bash>\n"
+        "<parameter=cmd>grep -RIn -- 'ContextHandler' . | head -50</parameter>\n"
+        "</function>"
+    )
+    assert naked_grep_head_with_repo_root.is_valid
+    assert naked_grep_head_with_repo_root.action == {
+        "tool_name": "bash",
+        "parameters": {
+            "cmd": "{ grep -RIn -- 'ContextHandler' . | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }"
+        },
+    }
+
+    naked_grep_head_with_path = parse_r2e_action(
+        "<function=bash>\n"
+        "<parameter=cmd>grep -RIn -- 'TransferEncodingError' /testbed/aiohttp | head -50</parameter>\n"
+        "</function>"
+    )
+    assert naked_grep_head_with_path.is_valid
+    assert naked_grep_head_with_path.action == {
+        "tool_name": "bash",
+        "parameters": {
+            "cmd": "{ grep -RIn -- 'TransferEncodingError' /testbed/aiohttp | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }"
+        },
+    }
+
+    already_safe_grep_head = parse_r2e_action(
+        "<function=bash>\n"
+        "<parameter=cmd>{ grep -RIn -- 'DiscreteVariable' . | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }</parameter>\n"
+        "</function>"
+    )
+    assert already_safe_grep_head.is_valid
+    assert already_safe_grep_head.action == {
+        "tool_name": "bash",
+        "parameters": {
+            "cmd": "{ grep -RIn -- 'DiscreteVariable' . | head -50; status=${PIPESTATUS[0]}; test \"$status\" -eq 0 -o \"$status\" -eq 141; }"
+        },
+    }
+
 
 def test_parse_r2e_action_normalizes_editor_paths_and_search_ranges():
     line_suffix = parse_r2e_action(
@@ -738,6 +860,45 @@ def test_parse_r2e_action_normalizes_editor_paths_and_search_ranges():
     )
     assert range_parameter.is_valid
     assert range_parameter.action["parameters"]["view_range"] == [227, 238]
+
+
+def test_parse_r2e_action_unescapes_editor_text_literals_only():
+    action = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter=command>str_replace</parameter>\n"
+        "<parameter=path>/testbed/aiohttp/http_parser.py</parameter>\n"
+        "<parameter=old_str>PARSE_CHUNKED_SIZE = 0\\nPARSE_CHUNKED_CHUNK = 1</parameter>\n"
+        "<parameter=new_str>PARSE_CHUNKED_SIZE = 0\\nPARSE_CHUNKED_CHUNK = 1\\nPARSE_CHUNKED_TRAILER = 2</parameter>\n"
+        "</function>"
+    )
+
+    assert action.is_valid
+    assert action.action["parameters"]["old_str"] == "PARSE_CHUNKED_SIZE = 0\nPARSE_CHUNKED_CHUNK = 1"
+    assert action.action["parameters"]["new_str"] == (
+        "PARSE_CHUNKED_SIZE = 0\nPARSE_CHUNKED_CHUNK = 1\nPARSE_CHUNKED_TRAILER = 2"
+    )
+    assert action.action["parameters"]["path"] == "/testbed/aiohttp/http_parser.py"
+
+    real_newline = parse_r2e_action(
+        "<function=str_replace_editor>\n"
+        "<parameter=command>str_replace</parameter>\n"
+        "<parameter=path>/testbed/a.py</parameter>\n"
+        "<parameter=old_str>line1\nline2\\nliteral</parameter>\n"
+        "<parameter=new_str>line1\nline2\\nliteral</parameter>\n"
+        "</function>"
+    )
+
+    assert real_newline.is_valid
+    assert real_newline.action["parameters"]["old_str"] == "line1\nline2\\nliteral"
+
+    bash = parse_r2e_action(
+        "<function=bash>\n"
+        "<parameter=cmd>printf 'a\\nb'</parameter>\n"
+        "</function>"
+    )
+    assert bash.is_valid
+    assert bash.action["parameters"]["cmd"] == "printf 'a\\nb'"
+
 
 def test_parse_r2e_action_accepts_malformed_parameter_tags():
     malformed_equals = parse_r2e_action(
@@ -1094,6 +1255,26 @@ def test_r2e_runtime_normalizes_grep_head_sigpipe_with_output():
     assert "Normalized grep|head SIGPIPE exit 141 to success" in result.observation
 
 
+def test_r2e_runtime_normalizes_r2e_string_grep_head_sigpipe_with_output():
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1))
+    runtime.env = SimpleNamespace(
+        runtime=SimpleNamespace(
+            run=lambda *args, **kwargs: ("/testbed/a.py:1:ContextHandler\n", "Error: Exit code 141")
+        )
+    )
+
+    result = runtime.run_bash("grep -RIn -- 'ContextHandler' . | head -50")
+
+    assert result.is_action_valid is True
+    assert result.info["tool_execution_success"] is True
+    assert result.info["fail_reason"] is None
+    assert result.info["tool_execution_fail_reason"] is None
+    assert result.info["exit_code"] == "0"
+    assert result.info["original_exit_code"] == "Error: Exit code 141"
+    assert result.info["normalized_exit_code"] == "0"
+    assert result.info["adapter_recovery"] == "grep_head_sigpipe"
+
+
 def test_r2e_runtime_does_not_normalize_empty_grep_head_sigpipe():
     runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1))
     runtime.env = SimpleNamespace(
@@ -1106,6 +1287,19 @@ def test_r2e_runtime_does_not_normalize_empty_grep_head_sigpipe():
     assert result.info["tool_execution_success"] is False
     assert result.info["fail_reason"] == "command_failed"
     assert "original_exit_code" not in result.info
+
+
+def test_r2e_runtime_suggests_focused_test_after_full_pytest_timeout():
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1))
+    runtime.env = SimpleNamespace(
+        runtime=SimpleNamespace(run=lambda *args, **kwargs: ("Command took too long", "-1"))
+    )
+
+    result = runtime.run_bash("python -m pytest -q")
+
+    assert result.info["tool_execution_success"] is False
+    assert result.info["fail_reason"] == "timeout"
+    assert "Full pytest timed out. Run a focused test file from r2e_tests or tests instead." in result.observation
 
 
 
@@ -1205,6 +1399,39 @@ def test_r2e_runtime_editor_repairs_missing_common_indent_before_retry():
     assert "repaired missing leading indentation" in result.observation
 
 
+def test_r2e_runtime_editor_repairs_literal_backslash_newlines_before_retry():
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if len(commands) == 1:
+            return (
+                "ERROR: No occurrences of 'PARSE_CHUNKED_SIZE = 0\\nPARSE_CHUNKED_CHUNK = 1' found in /testbed/aiohttp/http_parser.py for replacement.\n",
+                "0",
+            )
+        return ("The file /testbed/aiohttp/http_parser.py has been edited.", "0")
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=2000))
+    runtime.env = SimpleNamespace(runtime=SimpleNamespace(run=fake_run))
+
+    result = runtime.run_editor(
+        {
+            "command": "str_replace",
+            "path": "/testbed/aiohttp/http_parser.py",
+            "old_str": "PARSE_CHUNKED_SIZE = 0\\nPARSE_CHUNKED_CHUNK = 1",
+            "new_str": "PARSE_CHUNKED_SIZE = 0\\nPARSE_CHUNKED_CHUNK = 1\\nPARSE_CHUNKED_TRAILER = 2",
+        }
+    )
+
+    assert len(commands) == 2
+    assert "--old_str 'PARSE_CHUNKED_SIZE = 0\nPARSE_CHUNKED_CHUNK = 1'" in commands[1]
+    assert "PARSE_CHUNKED_TRAILER = 2" in commands[1]
+    assert result.info["tool_execution_success"] is True
+    assert result.info["literal_newline_repair_applied"] is True
+    assert result.info["editor_recovery_hint"] == "literal_backslash_newline_repaired"
+    assert "Literal backslash-n sequences were converted to real newlines" in result.observation
+
+
 def test_r2e_runtime_editor_repairs_view_range_scoped_nonunique_replace():
     commands = []
 
@@ -1278,6 +1505,72 @@ def test_r2e_runtime_separates_protocol_validity_from_editor_execution_failure()
     assert unsafe_path.info["tool_execution_fail_reason"] == "invalid_path"
 
 
+def _run_path_recovery_probe(runtime: R2ERepoRuntime, requested_path: str, tmp_root: Path) -> dict:
+    command = runtime._path_recovery_command(requested_path)
+    completed = subprocess.run(
+        f"R2E_PATH_RECOVERY_ROOT={shlex.quote(str(tmp_root))} {command}",
+        shell=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_r2e_runtime_path_recovery_ranks_import_symbol_source_before_tests(tmp_path):
+    root = tmp_path / "testbed"
+    (root / "Orange/widgets/tests").mkdir(parents=True)
+    (root / "Orange/widgets/settings.py").write_text(
+        "class ContextHandler:\n    pass\n\ndef initialize():\n    pass\n",
+        encoding="utf-8",
+    )
+    (root / "Orange/widgets/tests/test_settings.py").write_text(
+        "from Orange.widgets.settings import ContextHandler\n",
+        encoding="utf-8",
+    )
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=4000))
+    runtime.recent_tool_outputs = [
+        "/testbed/Orange/widgets/tests/test_settings.py:5:from Orange.widgets.settings import ContextHandler\n"
+        "from Orange.widgets.settings import ContextHandler\n"
+    ]
+
+    data = _run_path_recovery_probe(runtime, "/testbed/Orange/widgets/context_handler.py", root)
+
+    assert data["candidates"][0] == "/testbed/Orange/widgets/settings.py"
+    assert "/testbed/Orange/widgets/tests/test_settings.py" in data["candidates"]
+    assert data["candidates"].index("/testbed/Orange/widgets/settings.py") < data["candidates"].index(
+        "/testbed/Orange/widgets/tests/test_settings.py"
+    )
+
+
+def test_r2e_runtime_path_recovery_keeps_data_package_sources_before_tests(tmp_path):
+    root = tmp_path / "testbed"
+    (root / "Orange/data/tests").mkdir(parents=True)
+    for rel_path in (
+        "Orange/data/variable.py",
+        "Orange/data/domain.py",
+        "Orange/data/__init__.py",
+        "Orange/data/tests/test_variable.py",
+    ):
+        path = root / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# sample\n", encoding="utf-8")
+
+    runtime = R2ERepoRuntime(R2ERuntimeConfig(command_timeout=1, max_output_chars=4000))
+
+    data = _run_path_recovery_probe(runtime, "/testbed/Orange/data.py", root)
+
+    front = data["candidates"][:4]
+    assert "/testbed/Orange/data/variable.py" in front
+    assert "/testbed/Orange/data/domain.py" in front
+    assert "/testbed/Orange/data/__init__.py" in front
+    assert data["candidates"].index("/testbed/Orange/data/tests/test_variable.py") > data["candidates"].index(
+        "/testbed/Orange/data/variable.py"
+    )
+
+
 def test_r2e_runtime_editor_path_error_adds_candidate_recovery_hint():
     calls = []
 
@@ -1318,7 +1611,7 @@ def test_r2e_runtime_editor_path_error_adds_candidate_recovery_hint():
     assert "[path recovery] The requested path does not exist. Do not repeat this path." in result.observation
     assert "Candidate files:" in result.observation
     assert "/testbed/Orange/data/__init__.py" in result.observation
-    assert "Use one of the exact paths above" in result.observation
+    assert "Do not repeat the nonexistent path. Use one of the exact source candidates above." in result.observation
 
 
 def test_r2e_runtime_editor_path_error_falls_back_to_find_when_no_candidates():
@@ -1879,6 +2172,29 @@ def test_r2e_env_stops_after_repeated_failed_action_limit():
     assert infos[0]["exit_reason"] == "repeated_failed_action_limit"
 
 
+def test_r2e_env_can_soft_continue_after_repeated_failed_action_limit():
+    runtime = _PolicyRuntime()
+    env = _make_policy_env(runtime)
+    env.max_repeated_failed_action_blocks = 3
+    env.end_on_repeated_failed_action_limit = False
+    action = {"tool_name": "bash", "parameters": {"cmd": "grep -r missing ."}}
+
+    env.step([action])
+    env.step([action])
+    env.step([action])
+    obs, rewards, dones, infos = env.step([action])
+
+    assert runtime.bash_count == 1
+    assert dones == [False]
+    assert "Repeated failed-action limit reached" in obs[0]
+    assert "must switch strategy" in obs[0]
+    assert infos[0]["fail_reason"] == "repeated_failed_action_limit"
+    assert infos[0]["repeated_failed_action_limit"] is True
+    assert infos[0]["end_on_repeated_failed_action_limit"] is False
+    assert infos[0]["exit_reason"] is None
+    assert infos[0]["tool_execution_success"] is False
+
+
 def test_r2e_env_blocks_repeated_identical_view_without_source_edit():
     runtime = _PolicyRuntime()
     env = _make_policy_env(runtime)
@@ -1946,3 +2262,33 @@ def test_r2e_env_stops_after_repeated_no_progress_view_limit():
     assert infos[0]["repeated_no_progress_action_count"] == 3
     assert infos[0]["tool_execution_success"] is False
     assert infos[0]["exit_reason"] == "repeated_no_progress_action_limit"
+
+
+def test_r2e_env_can_soft_continue_after_repeated_no_progress_view_limit():
+    runtime = _PolicyRuntime()
+    env = _make_policy_env(runtime)
+    env.max_repeated_no_progress_actions = 3
+    env.end_on_repeated_no_progress_limit = False
+    action = {
+        "tool_name": "str_replace_editor",
+        "parameters": {
+            "command": "view",
+            "path": "/testbed/aiohttp/http_parser.py",
+            "view_range": [123, 127],
+        },
+    }
+
+    env.step([action])
+    env.step([action])
+    env.step([action])
+    obs, rewards, dones, infos = env.step([action])
+
+    assert runtime.editor_count == 1
+    assert dones == [False]
+    assert "Repeated no-progress limit reached" in obs[0]
+    assert "must switch strategy" in obs[0]
+    assert infos[0]["fail_reason"] == "repeated_no_progress_action_limit"
+    assert infos[0]["repeated_no_progress_action_limit"] is True
+    assert infos[0]["end_on_repeated_no_progress_limit"] is False
+    assert infos[0]["exit_reason"] is None
+    assert infos[0]["tool_execution_success"] is False

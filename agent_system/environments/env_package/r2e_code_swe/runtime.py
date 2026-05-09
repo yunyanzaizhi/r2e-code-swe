@@ -52,13 +52,37 @@ class R2EToolResult:
 
 def _is_recoverable_grep_head_sigpipe(command: str, exit_code: str, output: Any) -> bool:
     """grep | head can exit 141 when head closes after producing useful output."""
-    if str(exit_code) != "141" or not str(output or "").strip():
+    exit_text = str(exit_code or "").strip()
+    if not (
+        exit_text == "141"
+        or re.search(r"(?:^|\b)(?:Error:\s*)?Exit code\s+141(?:\b|$)", exit_text, flags=re.IGNORECASE)
+    ):
+        return False
+    if not str(output or "").strip():
         return False
     command_text = str(command or "")
     return bool(
         re.search(r"\bgrep\b", command_text, flags=re.DOTALL)
         and re.search(r"\|\s*head\b", command_text, flags=re.DOTALL)
     )
+
+
+def _is_full_pytest_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(str(command or ""))
+    except ValueError:
+        return False
+    if not tokens or any(token in {"&&", ";", "|"} for token in tokens):
+        return False
+    pytest_index = -1
+    if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
+        pytest_index = 2
+    elif tokens[0] == "pytest":
+        pytest_index = 0
+    else:
+        return False
+    pytest_args = tokens[pytest_index + 1 :]
+    return all(arg.startswith("-") for arg in pytest_args)
 
 
 _EDITOR_PATH_ERROR_RE = re.compile(
@@ -77,6 +101,16 @@ _EDITOR_PATH_ERROR_RE = re.compile(
 
 def _is_editor_path_error(output: str) -> bool:
     return bool(_EDITOR_PATH_ERROR_RE.search(str(output or "")))
+
+
+def _unescape_editor_text_literal(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if "\n" in value:
+        return value
+    if not any(token in value for token in ("\\n", "\\t", "\\r")):
+        return value
+    return value.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
 
 
 def _safe_name(text: str, max_len: int = 120) -> str:
@@ -161,6 +195,7 @@ class R2ERepoRuntime:
         self.episode_dir: Optional[Path] = None
         self.patch_path: Optional[Path] = None
         self.test_output_path: Optional[Path] = None
+        self.recent_tool_outputs: List[str] = []
 
     def _ensure_imports(self):
         src = Path(self.config.r2e_repo_root) / "src"
@@ -191,6 +226,7 @@ class R2ERepoRuntime:
         self.episode_dir.mkdir(parents=True, exist_ok=True)
         self.patch_path = None
         self.test_output_path = None
+        self.recent_tool_outputs = []
 
         try:
             self._check_docker()
@@ -255,6 +291,7 @@ class R2ERepoRuntime:
         original_code_s = str(code)
         code_s = original_code_s
         output_text = str(output or "")
+        self._remember_tool_output(output_text)
         recovery_message = ""
         recovered_grep_sigpipe = _is_recoverable_grep_head_sigpipe(user_command, original_code_s, output_text)
         if recovered_grep_sigpipe:
@@ -269,6 +306,11 @@ class R2ERepoRuntime:
         )
         execution_success = code_s == "0"
         fail_reason = None if execution_success else ("timeout" if code_s == "-1" and "too long" in str(output).lower() else "command_failed")
+        if fail_reason == "timeout" and _is_full_pytest_command(user_command):
+            observation += (
+                "\n[adapter hint] Full pytest timed out. "
+                "Run a focused test file from r2e_tests or tests instead."
+            )
         info = {
             "exit_code": code_s,
             "stdout": clip_text(output_text, self.config.max_output_chars, "stdout"),
@@ -326,37 +368,78 @@ class R2ERepoRuntime:
             parts.extend([f"--{key}", shlex.quote(str(value))])
         return " ".join(parts)
 
+    def _remember_tool_output(self, output: Any) -> None:
+        text = str(output or "")
+        if not text.strip():
+            return
+        self.recent_tool_outputs.append(text[-20000:])
+        self.recent_tool_outputs = self.recent_tool_outputs[-6:]
+
     def _path_recovery_command(self, path: str) -> str:
-        payload = {"path": str(path or "")}
+        recent_context = "\n".join(self.recent_tool_outputs[-6:])[-60000:]
+        payload = {"path": str(path or ""), "context": recent_context}
         encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
-        script = f"""import base64, json, os, re
+        script = """import base64, json, os, re
 from pathlib import Path
 
-payload = json.loads(base64.b64decode({json.dumps(encoded)}).decode("utf-8"))
-requested = Path(payload.get("path") or "/testbed")
-root = Path("/testbed")
-name = requested.name
-stem = requested.stem
-suffix = requested.suffix
+payload = json.loads(base64.b64decode(__PAYLOAD_B64__).decode("utf-8"))
+logical_root = Path("/testbed")
+fs_root = Path(os.environ.get("R2E_PATH_RECOVERY_ROOT", "/testbed"))
+requested_logical = Path(payload.get("path") or "/testbed")
+context = str(payload.get("context") or "")
+
+def logical_to_fs(path):
+    try:
+        rel = Path(path).relative_to(logical_root)
+        return fs_root.joinpath(*rel.parts)
+    except ValueError:
+        return Path(path)
+
+def fs_to_logical(path):
+    try:
+        rel = Path(path).relative_to(fs_root)
+        return str(logical_root.joinpath(*rel.parts))
+    except ValueError:
+        return str(path)
+
+requested = logical_to_fs(requested_logical)
+root = fs_root
+name = requested_logical.name
+stem = requested_logical.stem
+suffix = requested_logical.suffix
 
 terms = []
+symbols = []
 def add(term):
     term = str(term or "").strip()
     if term and term not in terms:
         terms.append(term)
 
+def add_symbol(symbol):
+    symbol = str(symbol or "").strip()
+    if symbol and symbol not in symbols:
+        symbols.append(symbol)
+    add(symbol)
+
+def snake_to_camel(text):
+    parts = [part for part in re.split(r"[_\\-.]+", str(text or "")) if part]
+    return "".join(part[:1].upper() + part[1:] for part in parts)
+
 add(name)
 add(stem)
+camel_stem = snake_to_camel(stem)
+if camel_stem:
+    add_symbol(camel_stem)
 for part in re.split(r"[_\\-.]+", stem):
     if len(part) >= 4:
         add(part)
 
 try:
-    relative_parts = requested.relative_to(root).parts
+    relative_parts = requested_logical.relative_to(logical_root).parts
 except ValueError:
-    relative_parts = requested.parts
+    relative_parts = requested_logical.parts
 for part in relative_parts[:-1]:
-    if part and part not in {{"", os.sep}}:
+    if part and part not in {"", os.sep}:
         add(part)
 
 parent = requested.parent
@@ -365,9 +448,84 @@ try:
 except Exception:
     parent_exists = False
 
-skip_dirs = {{".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".tox", ".venv", "venv"}}
+for match in re.finditer(r"\\b(?:class|def)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b", context):
+    add_symbol(match.group(1))
+for match in re.finditer(r"\\b[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning|Handler|Connector|Context|Variable)\\b", context):
+    add_symbol(match.group(0))
+
+def module_candidates(module):
+    parts = [part for part in str(module or "").split(".") if part]
+    if not parts:
+        return []
+    base = root.joinpath(*parts)
+    return [base.with_suffix(".py"), base / "__init__.py"]
+
+requested_symbols = set(symbols)
+import_paths = set()
+for match in re.finditer(r"\\bfrom\\s+([A-Za-z_][A-Za-z0-9_.]*)\\s+import\\s+([^\\n#]+)", context):
+    module = match.group(1)
+    imported = [name.strip().split(" as ")[0] for name in match.group(2).split(",")]
+    for imported_name in imported:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", imported_name):
+            add_symbol(imported_name)
+    if not requested_symbols or any(name in symbols or name in requested_symbols for name in imported):
+        for candidate in module_candidates(module):
+            import_paths.add(str(candidate))
+for match in re.finditer(r"\\bimport\\s+([A-Za-z_][A-Za-z0-9_.]*)", context):
+    for candidate in module_candidates(match.group(1)):
+        import_paths.add(str(candidate))
+
+grep_paths = set()
+for match in re.finditer(r"(?<![A-Za-z0-9_./-])(/testbed/[A-Za-z0-9_./+-]+\\.py)(?=[:\\s]|$)", context):
+    grep_paths.add(str(logical_to_fs(match.group(1))))
+for match in re.finditer(r"(?m)(?:^|\\s)(\\.?/?[A-Za-z0-9_./+-]+\\.py):\\d+:", context):
+    raw = match.group(1)
+    if raw.startswith("/testbed/"):
+        grep_paths.add(str(logical_to_fs(raw)))
+    elif raw.startswith("./"):
+        grep_paths.add(str(root / raw[2:]))
+    elif not raw.startswith("/"):
+        grep_paths.add(str(root / raw))
+
+skip_dirs = {".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".tox", ".venv", "venv", "build", "dist"}
 candidates = []
+seen_candidates = set()
 scanned = 0
+
+def path_penalty(path):
+    logical = fs_to_logical(path)
+    lower = logical.lower()
+    parts = [part.lower() for part in Path(logical).parts]
+    penalty = 0
+    if "/test/" in lower or "/tests/" in lower or Path(logical).name.startswith("test_"):
+        penalty += 40
+    if any(part in {"doc", "docs", "documentation"} for part in parts):
+        penalty += 25
+    if "egg-info" in lower or "/build/" in lower or "/dist/" in lower:
+        penalty += 35
+    if Path(logical).suffix != ".py":
+        penalty += 10
+    return penalty
+
+def add_candidate(path, rank, reason):
+    path = Path(path)
+    try:
+        if not path.exists() or not path.is_file():
+            return
+    except OSError:
+        return
+    logical = fs_to_logical(path)
+    if logical in seen_candidates:
+        return
+    seen_candidates.add(logical)
+    penalty = path_penalty(path)
+    candidates.append((rank + penalty, penalty, len(logical), logical, reason))
+
+for path in import_paths:
+    add_candidate(path, 0, "import")
+for path in grep_paths:
+    add_candidate(path, 1, "recent_grep_output")
+
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = [d for d in dirnames if d not in skip_dirs]
     dir_path = Path(dirpath)
@@ -376,16 +534,20 @@ for dirpath, dirnames, filenames in os.walk(root):
         if scanned > 50000:
             break
         file_path = dir_path / filename
-        file_text = str(file_path)
+        file_text = fs_to_logical(file_path)
         file_lower = file_text.lower()
         parts_lower = [part.lower() for part in file_path.parts]
         rank = 100
         if parent_exists:
             try:
                 file_path.relative_to(parent)
-                rank -= 20
+                rank = min(rank, 12)
             except ValueError:
                 pass
+        if str(file_path) in import_paths:
+            rank = min(rank, 0)
+        if str(file_path) in grep_paths:
+            rank = min(rank, 1)
         if name and filename == name:
             rank = min(rank, 0)
         if stem and file_path.stem == stem:
@@ -398,17 +560,34 @@ for dirpath, dirnames, filenames in os.walk(root):
             term_lower = term.lower()
             if term_lower and term_lower in file_lower:
                 rank = min(rank, 10 + index)
+        if file_path.suffix == ".py" and (symbols or terms):
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="ignore")[:250000]
+            except Exception:
+                content = ""
+            for index, symbol in enumerate(symbols):
+                if re.search(r"\\bclass\\s+" + re.escape(symbol) + r"\\b", content):
+                    rank = min(rank, 2 + index)
+                elif re.search(r"\\bdef\\s+" + re.escape(symbol) + r"\\b", content):
+                    rank = min(rank, 3 + index)
+                elif symbol and symbol in content:
+                    rank = min(rank, 8 + index)
+            content_lower = content.lower()
+            for index, term in enumerate(terms):
+                term_lower = term.lower()
+                if len(term_lower) >= 4 and term_lower in content_lower:
+                    rank = min(rank, 20 + index)
         if suffix and file_path.suffix == suffix:
             rank -= 1
         if rank < 100:
-            candidates.append((rank, len(file_text), file_text))
+            add_candidate(file_path, rank, "scan")
     if scanned > 50000:
         break
 
 candidates.sort()
 paths = []
 seen = set()
-for _, _, file_text in candidates:
+for _, _, _, file_text, _ in candidates:
     if file_text in seen:
         continue
     seen.add(file_text)
@@ -416,8 +595,8 @@ for _, _, file_text in candidates:
     if len(paths) >= 20:
         break
 
-print(json.dumps({{"candidates": paths, "terms": terms[:8], "scanned": scanned}}))
-"""
+print(json.dumps({"candidates": paths, "terms": terms[:8], "symbols": symbols[:8], "scanned": scanned}))
+""".replace("__PAYLOAD_B64__", json.dumps(encoded))
         return "bash -lc " + shlex.quote("python3 - <<'PY'\n" + script + "\nPY")
 
     def _path_recovery_hint(self, path: str) -> Tuple[str, List[str]]:
@@ -450,7 +629,7 @@ print(json.dumps({{"candidates": paths, "terms": terms[:8], "scanned": scanned}}
         if candidates:
             lines.append("Candidate files:")
             lines.extend(f"- {candidate}" for candidate in candidates[:20])
-            lines.append("Use one of the exact paths above, or run find/grep again.")
+            lines.append("Do not repeat the nonexistent path. Use one of the exact source candidates above.")
         else:
             lines.append("Candidate files: none found.")
             lines.append("Run pwd && find . -maxdepth 4 -type f | head -160, then use exact paths from output.")
@@ -627,6 +806,47 @@ print(json.dumps({{
             return retry_text, retry_code_s
         return None
 
+    def _try_literal_newline_repair(self, params: Dict[str, Any], output_text: str) -> Optional[R2EToolResult]:
+        if str(params.get("command") or "") != "str_replace":
+            return None
+        if params.get("old_str") is None or params.get("new_str") is None:
+            return None
+        if "No occurrences of" not in str(output_text):
+            return None
+        repaired_params = dict(params)
+        repaired_params["old_str"] = _unescape_editor_text_literal(repaired_params.get("old_str"))
+        repaired_params["new_str"] = _unescape_editor_text_literal(repaired_params.get("new_str"))
+        if repaired_params["old_str"] == params.get("old_str") and repaired_params["new_str"] == params.get("new_str"):
+            return None
+
+        retry_output, retry_code = self.env.runtime.run(
+            self._build_editor_command(repaired_params),
+            timeout=self.config.command_timeout,
+            workdir="/testbed",
+        )
+        retry_code_s = str(retry_code)
+        retry_text = str(retry_output or "")
+        retry_invalid = retry_text.lstrip().startswith("ERROR:")
+        if retry_code_s != "0" or retry_invalid:
+            return None
+
+        retry_text += "\n[editor recovery] Literal backslash-n sequences were converted to real newlines for str_replace."
+        observation = f"Exit code: {retry_code_s}\n[output]\n{clip_text(retry_text, self.config.max_output_chars, 'editor output')}"
+        return R2EToolResult(
+            observation=observation,
+            is_action_valid=True,
+            info={
+                "exit_code": retry_code_s,
+                "stdout": clip_text(retry_text, self.config.max_output_chars, "stdout"),
+                "stderr": "",
+                "fail_reason": None,
+                "tool_execution_success": True,
+                "tool_execution_fail_reason": None,
+                "literal_newline_repair_applied": True,
+                "editor_recovery_hint": "literal_backslash_newline_repaired",
+            },
+        )
+
     def _try_missing_indent_repair(self, params: Dict[str, Any], output_text: str) -> Optional[R2EToolResult]:
         if str(params.get("command") or "") != "str_replace":
             return None
@@ -742,11 +962,15 @@ print(json.dumps({{
         output, code = self.env.runtime.run(self._build_editor_command(params), timeout=self.config.command_timeout, workdir="/testbed")
         code_s = str(code)
         output_text = str(output or "")
+        self._remember_tool_output(output_text)
         invalid_from_output = output_text.lstrip().startswith("ERROR:")
         execution_success = code_s == "0" and not invalid_from_output
         fail_reason = None if execution_success else "editor_error"
         editor_recovery_hint = None
         if not execution_success:
+            repaired = self._try_literal_newline_repair(params, output_text)
+            if repaired is not None:
+                return repaired
             repaired = self._try_missing_indent_repair(params, output_text)
             if repaired is not None:
                 return repaired

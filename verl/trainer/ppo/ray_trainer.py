@@ -197,6 +197,16 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     return data, metrics
 
+def _valid_action_ratio_from_non_tensor_batch(non_tensor_batch) -> float:
+    action_valids = non_tensor_batch['is_action_valid'].astype(np.float32)
+    if 'active_masks' in non_tensor_batch:
+        active_masks = non_tensor_batch['active_masks'].astype(bool)
+        if active_masks.any():
+            return np.mean(action_valids[active_masks]).item()
+        return 1.0
+    return np.mean(action_valids).item()
+
+
 def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=float):
     reward_tensor = data.batch['token_level_scores']
     if 'step_rewards' in data.batch.keys():
@@ -210,16 +220,20 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
 
         valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
 
+        active = True
+        if 'active_masks' in data_item.non_tensor_batch:
+            active = bool(np.asarray(data_item.non_tensor_batch['active_masks']).item())
         action_valids = data_item.non_tensor_batch['is_action_valid'].astype(np.float32)
         action_invalids = torch.tensor(1 - action_valids, dtype=torch.float32, device=prompt_ids.device).squeeze(0)
         # invalid action penalty
         # assert reward_tensor[i, valid_response_length - 1] != 0.0, f'i={i}'
-        reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
+        if active:
+            reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
 
-        if 'step_rewards' in data.batch.keys():
+        if active and 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
     
-    valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
+    valid_action_ratio = _valid_action_ratio_from_non_tensor_batch(data.non_tensor_batch)
     metrics = {'episode/valid_action_ratio': valid_action_ratio}
     return data, metrics
 

@@ -378,6 +378,8 @@ env:
     require_validation_before_submit: true
     max_repeated_failed_action_blocks: 3
     max_repeated_no_progress_actions: 3
+    end_on_repeated_no_progress_limit: true
+    end_on_repeated_failed_action_limit: true
     reward_shaping:
       enabled: true
       repo_explored: 0.01

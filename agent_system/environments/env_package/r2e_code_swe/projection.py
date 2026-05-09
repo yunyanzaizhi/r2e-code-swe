@@ -63,7 +63,11 @@ def _extract_markdown_json_action(text: str) -> str | None:
 
 
 def _extract_xml_action(text: str) -> str:
-    matches = re.findall(r"<function\s*=\s*[^>]+>.*?</function>", text, flags=re.DOTALL)
+    matches = re.findall(
+        r"<function\s*=\s*[^>/\s]+(?:\s*)/>|<function\s*=\s*[^>]+>.*?</function>",
+        text,
+        flags=re.DOTALL,
+    )
     if len(matches) > 1:
         raise ValueError("Action format error: expected exactly one XML tool call, but found multiple.")
     return matches[0] if matches else text
@@ -119,6 +123,9 @@ def _parse_key_value_chunks(body: str) -> Dict[str, str]:
 
 def _parse_xml_action(text: str) -> Dict[str, Any]:
     action_text = _extract_xml_action(text)
+    self_closing_match = re.fullmatch(r"\s*<function\s*=\s*([^>/\s]+)\s*/>\s*", action_text, flags=re.DOTALL)
+    if self_closing_match:
+        return {"tool_name": self_closing_match.group(1).strip(), "parameters": {}}
     fn_match = re.search(r"<function\s*=\s*([^>]+)>", action_text)
     if not fn_match:
         raise ValueError("Action format error: expected exactly one XML tool call or JSON object.")
@@ -349,6 +356,11 @@ _GREP_WITHOUT_PATH_RE = re.compile(
     r"(?P<prefix>(?:^|[;&|]{2})\s*)grep\s+(?P<flags>-[A-Za-z]*n[A-Za-z]*)\s+"
     r"(?P<pattern>'[^']*'|\"[^\"]*\"|[^\s;&|]+)\s*(?=(?:&&|\|\||;|$))"
 )
+_GREP_HEAD_PIPE_RE = re.compile(
+    r"(?P<grep>\bgrep\b(?:(?:'[^']*'|\"[^\"]*\"|\\.|[^|;&\n])+?))"
+    r"\s*\|\s*"
+    r"(?P<head>head(?:\s+(?:-[0-9]+|-n\s+[0-9]+))?)"
+)
 
 
 def _repair_cd_file_path(cmd: str) -> str:
@@ -367,8 +379,35 @@ def _repair_grep_without_path(cmd: str) -> str:
     return _GREP_WITHOUT_PATH_RE.sub(replace, cmd).strip()
 
 
+def _repair_grep_head_pipelines(cmd: str) -> str:
+    def replace(match: re.Match) -> str:
+        # Already-safe examples intentionally inspect PIPESTATUS after head.
+        # Leave those untouched so repeated parsing is idempotent.
+        tail = cmd[match.end() : match.end() + 120]
+        if "PIPESTATUS" in tail:
+            return match.group(0)
+        grep_cmd = match.group("grep").strip()
+        head_cmd = match.group("head").strip()
+        return f'{{ {grep_cmd} | {head_cmd}; status=${{PIPESTATUS[0]}}; test "$status" -eq 0 -o "$status" -eq 141; }}'
+
+    return _GREP_HEAD_PIPE_RE.sub(replace, cmd).strip()
+
+
 def _repair_bash_command(cmd: str) -> str:
-    return _repair_grep_without_path(_repair_cd_file_path(cmd)).strip()
+    repaired = _repair_cd_file_path(cmd)
+    repaired = _repair_grep_without_path(repaired)
+    repaired = _repair_grep_head_pipelines(repaired)
+    return repaired.strip()
+
+
+def _unescape_editor_text_literal(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if "\n" in value:
+        return value
+    if not any(token in value for token in ("\\n", "\\t", "\\r")):
+        return value
+    return value.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
 
 
 def _normalize_action(raw_action: Dict[str, Any]) -> Dict[str, Any]:
@@ -421,6 +460,9 @@ def _normalize_action(raw_action: Dict[str, Any]) -> Dict[str, Any]:
             params["insert_line"] = suffix_range[0]
         if command == "create" and params.get("file_text") is None:
             raise ValueError("str_replace_editor create requires 'file_text'.")
+        for text_key in ("old_str", "new_str", "file_text"):
+            if text_key in params:
+                params[text_key] = _unescape_editor_text_literal(params[text_key])
         if command == "str_replace":
             old_str = params.get("old_str")
             new_str = params.get("new_str")

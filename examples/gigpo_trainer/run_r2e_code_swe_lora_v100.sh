@@ -75,6 +75,10 @@ val_dataset=${R2E_VAL_DATASET:-R2E-Gym/R2E-Gym-Lite}
 val_split=${R2E_VAL_SPLIT:-dev_10pr_v1}
 trajectory_dir=${R2E_TRAJECTORY_DIR:-experiments/logs/r2e_code_swe/train_trajectories}
 patches_dir=${R2E_PATCHES_DIR:-experiments/logs/r2e_code_swe/train_patches}
+max_repeated_no_progress_actions=${R2E_MAX_REPEATED_NO_PROGRESS_ACTIONS:-6}
+max_repeated_failed_action_blocks=${R2E_MAX_REPEATED_FAILED_ACTION_BLOCKS:-5}
+end_on_repeated_no_progress_limit=${R2E_END_ON_REPEATED_NO_PROGRESS_LIMIT:-false}
+end_on_repeated_failed_action_limit=${R2E_END_ON_REPEATED_FAILED_ACTION_LIMIT:-false}
 
 if [[ "${train_split}" == "dev_10pr_v1" && "${ALLOW_TRAIN_ON_DEV:-false}" != "true" ]]; then
   echo "Refusing to train on dev_10pr_v1. Use R2E_TRAIN_SPLIT=train or set ALLOW_TRAIN_ON_DEV=true for an intentional debug run."
@@ -154,6 +158,10 @@ python3 -m verl.trainer.main_ppo \
   env.r2e_code_swe.max_train_samples="${train_data_size}" \
   env.r2e_code_swe.max_val_samples="${val_data_size}" \
   env.r2e_code_swe.allow_train_on_dev="${ALLOW_TRAIN_ON_DEV:-false}" \
+  env.r2e_code_swe.max_repeated_no_progress_actions="${max_repeated_no_progress_actions}" \
+  env.r2e_code_swe.max_repeated_failed_action_blocks="${max_repeated_failed_action_blocks}" \
+  env.r2e_code_swe.end_on_repeated_no_progress_limit="${end_on_repeated_no_progress_limit}" \
+  env.r2e_code_swe.end_on_repeated_failed_action_limit="${end_on_repeated_failed_action_limit}" \
   env.r2e_code_swe.runtime.command_timeout=60 \
   env.r2e_code_swe.runtime.reward_timeout=300 \
   env.r2e_code_swe.runtime.max_output_chars=12000 \
