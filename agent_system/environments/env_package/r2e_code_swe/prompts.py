@@ -22,83 +22,6 @@ Invalid:
 
 
 
-FOCUSED_VALIDATION_MAX_PASS_TO_PASS = 2
-
-
-def _as_string_list(value: Any) -> List[str]:
-    if value in (None, ""):
-        return []
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    if isinstance(value, (list, tuple)):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return [str(value).strip()] if str(value).strip() else []
-
-
-def _unique_strings(values: Iterable[str]) -> List[str]:
-    seen = set()
-    unique: List[str] = []
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        unique.append(text)
-    return unique
-
-
-def focused_validation_cmd(task: Optional[R2ECodeSWETask]) -> str:
-    """Return the best focused validation command that can be safely shown to the model."""
-    spec = dict(getattr(task, "test_spec", None) or {})
-    run_tests = spec.get("run_tests")
-    run_test_cmds = _as_string_list(run_tests)
-    if run_test_cmds:
-        return " && ".join(run_test_cmds)
-
-    fail_to_pass = _as_string_list(spec.get("FAIL_TO_PASS"))
-    pass_to_pass = _as_string_list(spec.get("PASS_TO_PASS"))[:FOCUSED_VALIDATION_MAX_PASS_TO_PASS]
-    targets = _unique_strings([*fail_to_pass, *pass_to_pass])
-    if targets:
-        return "python -m pytest -q " + " ".join(shlex.quote(target) for target in targets)
-    return "python -m pytest -q"
-
-
-_ISSUE_TERM_PATTERNS = (
-    re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Warning)\b"),
-    re.compile(r"\b[A-Z][A-Za-z0-9_]{2,}\b"),
-)
-_COMMON_ISSUE_TERMS = {
-    "The", "This", "When", "After", "Before", "Saving", "Fix", "Bug", "Issue", "Repository",
-    "Docker", "Workspace", "FAIL", "PASS", "HTTP", "JSON", "XML",
-}
-
-
-def issue_search_terms(task: Optional[R2ECodeSWETask], max_terms: int = 3) -> List[str]:
-    text = str(getattr(task, "problem_statement", "") or "")
-    candidates: List[str] = []
-    for pattern in _ISSUE_TERM_PATTERNS:
-        for match in pattern.findall(text):
-            if match in _COMMON_ISSUE_TERMS:
-                continue
-            if match not in candidates:
-                candidates.append(match)
-            if len(candidates) >= max_terms:
-                return candidates
-    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", text)
-    for word in words:
-        if word in _COMMON_ISSUE_TERMS:
-            continue
-        if word not in candidates:
-            candidates.append(word)
-        if len(candidates) >= max_terms:
-            return candidates
-    return candidates or ["bug"]
-
-
-def _issue_grep_command(task: Optional[R2ECodeSWETask]) -> str:
-    term = issue_search_terms(task)[0]
-    return f"grep -RIn -- {shlex.quote(term)} . | head -50"
-
 def _normalize_tool_mask(tool_mask: Optional[Dict[str, Any]], *, initial: bool = False) -> Dict[str, Any]:
     mask = dict(tool_mask or {})
     allow_bash = bool(mask.get("allow_bash", True))
@@ -225,19 +148,37 @@ def _issue_grep_example(task: Optional[R2ECodeSWETask]) -> str:
 
 
 def _as_string_list(value: Any) -> List[str]:
-    if not isinstance(value, list):
+    if value in (None, ""):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _unique_strings(values: List[str]) -> List[str]:
+    seen = set()
+    unique: List[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
 
 
 def focused_validation_cmd(task: Optional[R2ECodeSWETask], max_pass_to_pass: int = 2) -> str:
     test_spec = getattr(task, "test_spec", None) or {}
-    run_tests = str(test_spec.get("run_tests") or "").strip()
+    run_tests = _as_string_list(test_spec.get("run_tests"))
     if run_tests:
-        return run_tests
+        return " && ".join(run_tests)
 
-    selected_tests = _as_string_list(test_spec.get("FAIL_TO_PASS"))
-    selected_tests.extend(_as_string_list(test_spec.get("PASS_TO_PASS"))[:max_pass_to_pass])
+    selected_tests = _unique_strings(
+        _as_string_list(test_spec.get("FAIL_TO_PASS"))
+        + _as_string_list(test_spec.get("PASS_TO_PASS"))[:max_pass_to_pass]
+    )
     if selected_tests:
         return "python -m pytest -q " + " ".join(shlex.quote(test) for test in selected_tests)
     return "python -m pytest -q"
@@ -277,14 +218,7 @@ def format_r2e_tool_mask(
         allowed.append(
             "<function=str_replace_editor>\n"
             "<parameter=command>view</parameter>\n"
-            "<parameter=path>/testbed/path/to/relevant_file.py</parameter>\n"
-            "</function>"
-        )
-        allowed.append(
-            "<function=str_replace_editor>\n"
-            "<parameter=command>view</parameter>\n"
-            "<parameter=path>/testbed/path/to/relevant_file.py</parameter>\n"
-            "<parameter=view_range>[1, 120]</parameter>\n"
+            "<parameter=path>/testbed</parameter>\n"
             "</function>"
         )
     if mask["allow_validate"]:
@@ -347,8 +281,8 @@ Export the current git diff as your patch and run R2E unit-test reward. Submit o
 
 R2E_WORKFLOW_HINTS = """Search and edit strategy:
 - R2E places the repository root directly at /testbed. The current bash cwd is already /testbed. Do not assume a subdirectory named after the repository exists; use the actual paths shown by the workspace preview or by find.
-- The default bash cwd is /testbed. Do not cd into a file path such as /testbed/path/to/relevant_file.py; cd into its directory or use the absolute file path directly.
-- For text search, include both a pattern and a real path. Start from the issue-specific grep shown in Allowed tool calls, for example grep -RIn -- '<issue keyword>' . | head -50. Then try nearby class names, function names, error names, or user-visible strings from the issue. A command like grep -n 'term' without a file or directory will fail.
+- The default bash cwd is /testbed. Do not cd into a file path; cd into its directory or use the absolute file path directly.
+- For text search, include both a pattern and a real path: start with the issue-specific grep example shown in Allowed tool calls. Then try nearby class names, function names, error names, or user-visible strings from the issue. A command like grep -n 'term' without a file or directory will fail.
 - After search results, inspect only the relevant lines with str_replace_editor view and view_range, for example <parameter=view_range>[1, 120]</parameter>. Avoid repeatedly viewing an entire large file.
 - If an observation says a command was blocked as repeated or output was clipped, change strategy immediately: narrow the path/range, search a different symbol, or inspect a different file.
 - If str_replace says old_str is not unique, do not retry the same one-line replacement. View the target range and copy a larger consecutive block into old_str.

@@ -193,7 +193,7 @@ def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():
     assert "<parameter=cmd>grep -RIn -- 'IncompatibleContext' . | head -50</parameter>" in prompt
     assert "<function=str_replace_editor>" in prompt
     assert "<parameter=command>view</parameter>" in prompt
-    assert "<parameter=path>/testbed/path/to/relevant_file.py</parameter>" in prompt
+    assert "<parameter=path>/testbed</parameter>" in prompt
     assert "Allowed tool calls now:" in prompt
     assert "<function=validate>" not in prompt
     assert "<function=submit></function>" not in prompt
@@ -212,7 +212,7 @@ def test_prompt_enforces_single_safe_tool_call_with_issue_specific_examples():
     assert "R2E places the repository root directly at /testbed" in prompt
     assert "Do not assume a subdirectory named after the repository exists" in prompt
     assert "Do not cd into a file path" in prompt
-    assert "grep -RIn -- '<issue keyword>' . | head -50" in prompt
+    assert "start with the issue-specific grep example" in prompt
     assert "<parameter=view_range>[1, 120]</parameter>" in prompt
     assert "Do not submit until at least one successful source edit" in prompt
     assert "one post-edit validation command" in prompt
